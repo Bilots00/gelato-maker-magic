@@ -64,16 +64,8 @@ const handleProductLoad = async () => {
   try {
     console.log("[selector] loading templateId:", productId);
 
-    const { data, error } = await supabase.functions.invoke("gelato-get-template", {
-      body: { templateId: productId }, // POST con body
-    });
-
-    if (error) {
-      console.error("[selector] edge error:", error);
-      throw new Error(error.message || "Edge Function returned a non-2xx status code");
-    }
-
-    const template = data;
+    // ⬇️ usa l’helper che chiama l’Edge Function
+    const template = await getTemplate(productId);
     console.log("[selector] template data:", template);
 
     const product: Product = {
@@ -92,7 +84,7 @@ const handleProductLoad = async () => {
 
     toast({ title: "Template loaded", description: `Loaded: ${product.name}` });
   } catch (e: any) {
-    console.error("Error loading template:", e);
+    console.error("[selector] Error loading template:", e);
     toast({
       title: "Error loading template",
       description: e?.message ?? "Failed to load template from Gelato API",
@@ -102,7 +94,6 @@ const handleProductLoad = async () => {
     setIsLoading(false);
   }
 };
-
 
 
   const handleSampleSelect = async (_sample: Product) => {

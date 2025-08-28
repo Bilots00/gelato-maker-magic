@@ -13,6 +13,7 @@ import { useToast } from "@/hooks/use-toast";
 import { bulkCreate, getTemplate } from "@/lib/supabaseFetch";
 import { supabase } from "@/integrations/supabase/client";
 
+const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
 
 interface ImageFile {
   id: string;
