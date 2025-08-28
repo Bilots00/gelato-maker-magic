@@ -6,7 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { ExternalLink, Package, Plus, Loader2 } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { supabase } from "@/integrations/supabase/client";
+import { getTemplate } from "@/lib/supabaseFetch";
 import { useToast } from "@/components/ui/use-toast";
 
 interface Product {
@@ -53,50 +53,43 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
   const [showSamples, setShowSamples] = useState(true);
   const { toast } = useToast();
 
-  const handleProductLoad = async () => {
-    if (!productId.trim()) return;
-    
-    setIsLoading(true);
-    try {
-      console.log(`Fetching template ${productId} from Gelato API`);
-      
-      const { data, error } = await supabase.functions.invoke('gelato-get-template', {
-        body: { templateId: productId }
-      });
+ const handleProductLoad = async () => {
+  if (!productId.trim()) return;
 
-      if (error) {
-        throw new Error(error.message);
-      }
+  setIsLoading(true);
+  try {
+    // chiamiamo la GET /functions/v1/gelato-get-template?templateId=...
+    const tpl = await getTemplate(productId.trim());
 
-      const template = data;
-      console.log('Template data received:', template);
+    const product: Product = {
+      id: tpl.id, // UUID reale
+      name: tpl.title || productName || `Template ${productId}`,
+      type: tpl.productType || "apparel",
+      variants: (tpl.variants ?? []).map((v: any) => v.title) || ["Default"],
+      printAreas:
+        tpl.variants?.[0]?.imagePlaceholders?.map((p: any) => p.name) ||
+        tpl.imagePlaceholders?.map((p: any) => p.name) ||
+        ["front"],
+    };
 
-      const product: Product = {
-        id: template.id,
-        name: template.title || productName || `Template ${productId}`,
-        type: template.productType || "apparel",
-        variants: template.variants?.map((v: any) => v.title) || ["Default"],
-        printAreas: template.variants?.[0]?.imagePlaceholders?.map((p: any) => p.name) || ["front"]
-      };
+    onProductSelect(product);
 
-      onProductSelect(product);
-      
-      toast({
-        title: "Template loaded",
-        description: `Successfully loaded template: ${product.name}`,
-      });
+    toast({
+      title: "Template loaded",
+      description: `Loaded: ${product.name}`,
+    });
+  } catch (error: any) {
+    console.error("Error loading template:", error);
+    toast({
+      title: "Error loading template",
+      description: error?.message ?? "Failed to load template from Gelato API",
+      variant: "destructive",
+    });
+  } finally {
+    setIsLoading(false);
+  }
+};
 
-    } catch (error) {
-      console.error('Error loading template:', error);
-      toast({
-        title: "Error loading template",
-        description: error instanceof Error ? error.message : 'Failed to load template from Gelato API',
-        variant: "destructive",
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   const handleSampleSelect = (product: Product) => {
     onProductSelect(product);
@@ -118,10 +111,10 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="productId">Product ID</Label>
+            <Label htmlFor="productId">Gelato Template ID (UUID)</Label>
             <Input
               id="productId"
-              placeholder="e.g., gelato-product-123456"
+              placeholder="e.g., 184d99bc-8fbb-40c2-a2f7-32adfc709e98"
               value={productId}
               onChange={(e) => setProductId(e.target.value)}
             />
