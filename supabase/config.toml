@@ -1,1 +1,7 @@
 project_id = "ekrdwsmrbeleyhbrjiib"
+
+[functions.gelato-get-template]
+verify_jwt = false
+
+[functions.gelato-bulk-create]
+verify_jwt = false

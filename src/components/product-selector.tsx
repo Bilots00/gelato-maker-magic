@@ -4,14 +4,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { ExternalLink, Package, Plus } from "lucide-react";
+import { ExternalLink, Package, Plus, Loader2 } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { supabase } from "@/integrations/supabase/client";
+import { useToast } from "@/components/ui/use-toast";
 
 interface Product {
   id: string;
   name: string;
   type: string;
-  variants: number;
+  variants: string[];
   printAreas: string[];
 }
 
@@ -25,21 +27,21 @@ const sampleProducts: Product[] = [
     id: "gelato-tshirt-001",
     name: "Premium T-Shirt",
     type: "Apparel",
-    variants: 24,
+    variants: ["S", "M", "L", "XL"],
     printAreas: ["Front", "Back"]
   },
   {
     id: "gelato-mug-001", 
     name: "Ceramic Mug 11oz",
     type: "Drinkware",
-    variants: 12,
+    variants: ["11oz", "15oz"],
     printAreas: ["Wrap Around"]
   },
   {
     id: "gelato-poster-001",
     name: "Premium Poster",
     type: "Wall Art",
-    variants: 8,
+    variants: ["12x18", "18x24"],
     printAreas: ["Full Coverage"]
   }
 ];
@@ -49,24 +51,51 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
   const [productName, setProductName] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [showSamples, setShowSamples] = useState(true);
+  const { toast } = useToast();
 
   const handleProductLoad = async () => {
     if (!productId.trim()) return;
     
     setIsLoading(true);
-    // Simulate API call to fetch product details
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    const mockProduct: Product = {
-      id: productId,
-      name: productName || "Custom Product",
-      type: "Custom",
-      variants: 16,
-      printAreas: ["Front", "Back"]
-    };
-    
-    onProductSelect(mockProduct);
-    setIsLoading(false);
+    try {
+      console.log(`Fetching template ${productId} from Gelato API`);
+      
+      const { data, error } = await supabase.functions.invoke('gelato-get-template', {
+        body: { templateId: productId }
+      });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      const template = data;
+      console.log('Template data received:', template);
+
+      const product: Product = {
+        id: template.id,
+        name: template.title || productName || `Template ${productId}`,
+        type: template.productType || "apparel",
+        variants: template.variants?.map((v: any) => v.title) || ["Default"],
+        printAreas: template.variants?.[0]?.imagePlaceholders?.map((p: any) => p.name) || ["front"]
+      };
+
+      onProductSelect(product);
+      
+      toast({
+        title: "Template loaded",
+        description: `Successfully loaded template: ${product.name}`,
+      });
+
+    } catch (error) {
+      console.error('Error loading template:', error);
+      toast({
+        title: "Error loading template",
+        description: error instanceof Error ? error.message : 'Failed to load template from Gelato API',
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleSampleSelect = (product: Product) => {
@@ -117,7 +146,14 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
             disabled={!productId.trim() || isLoading}
             className="w-full"
           >
-            {isLoading ? "Loading Product..." : "Load Product"}
+            {isLoading ? (
+              <>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Loading Template...
+              </>
+            ) : (
+              "Load Template"
+            )}
           </Button>
         </CardContent>
       </Card>
@@ -151,7 +187,7 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
                       <div className="space-y-2 text-xs text-muted-foreground">
                         <div className="flex justify-between">
                           <span>Variants:</span>
-                          <span>{product.variants}</span>
+                          <span>{product.variants.length}</span>
                         </div>
                         <div>
                           <span>Print Areas:</span>
@@ -193,7 +229,7 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
                 <div className="flex items-center space-x-4 mt-2 text-xs text-muted-foreground">
                   <span>ID: {selectedProduct.id}</span>
                   <span>•</span>
-                  <span>{selectedProduct.variants} variants</span>
+                  <span>{selectedProduct.variants.length} variants</span>
                   <span>•</span>
                   <span>{selectedProduct.printAreas.join(", ")}</span>
                 </div>
