@@ -58,40 +58,47 @@ const handleProductLoad = async () => {
 
   setIsLoading(true);
   try {
-    console.log(`Fetching template ${productId} from Gelato API`);
+    console.log("[selector] loading templateId:", productId);
 
-    // ⬇️ chiamata via GET con query string (coerente con la Edge)
-    const template: any = await getTemplate(productId);
+    const { data, error } = await supabase.functions.invoke("gelato-get-template", {
+      body: { templateId: productId }, // POST con body
+    });
 
-    // ⬇️ usa gli ID veri, non i titoli
+    if (error) {
+      console.error("[selector] edge error:", error);
+      throw new Error(error.message || "Edge Function returned a non-2xx status code");
+    }
+
+    const template = data;
+    console.log("[selector] template data:", template);
+
     const product: Product = {
       id: template.id,
       name: template.title || productName || `Template ${productId}`,
-      type: template.productType || "unknown",
-      variants: (template.variants ?? []).map((v: any) => v.id),
-      printAreas: (template.variants?.[0]?.imagePlaceholders ?? []).map(
-        (p: any) => p.name
-      ),
+      type: template.productType || "apparel",
+      variants: (template.variants || []).map((v: any) => v.title),
+      printAreas:
+        template.variants?.[0]?.imagePlaceholders?.map((p: any) => p.name) ||
+        template.imagePlaceholders?.map((p: any) => p.name) ||
+        ["front"],
     };
 
     onProductSelect(product);
     setShowSamples(false);
 
-    toast({
-      title: "Template loaded",
-      description: `Loaded: ${product.name}`,
-    });
-  } catch (error: any) {
-    console.error("Error loading template:", error);
+    toast({ title: "Template loaded", description: `Loaded: ${product.name}` });
+  } catch (e: any) {
+    console.error("Error loading template:", e);
     toast({
       title: "Error loading template",
-      description: error?.message ?? "Failed to load template from Gelato API",
+      description: e?.message ?? "Failed to load template from Gelato API",
       variant: "destructive",
     });
   } finally {
     setIsLoading(false);
   }
 };
+
 
 
   const handleSampleSelect = (product: Product) => {

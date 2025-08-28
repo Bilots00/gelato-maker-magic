@@ -129,6 +129,19 @@ const isUuid = (s?: string) => !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f
 const handleCreateProducts = async () => {
   if (!images.length || !selectedProduct) return;
 
+  // Blocco di guardia: serve un vero UUID (o carica un template con "Load Template")
+const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+if (!uuidRe.test(selectedProduct.id)) {
+  setIsCreating(false);
+  toast({
+    title: "Invalid template",
+    description: "In Step 3 carica un vero Template ID Gelato (UUID) e premi “Load Template”.",
+    variant: "destructive",
+  });
+  return;
+}
+
+
   setIsCreating(true);
   setCreationProgress(0);
 
@@ -401,9 +414,7 @@ const hasSuccess = successCount > 0;
       <span>Creating products...</span>
     </div>
     <Progress value={creationProgress} />
-    <p className="text-sm text-muted-foreground">
-      {Math.round(creationProgress)}% complete
-    </p>
+    <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% complete</p>
   </div>
 ) : hasSuccess ? (
   <div className="space-y-4">
@@ -411,18 +422,12 @@ const hasSuccess = successCount > 0;
       <CheckCircle className="h-5 w-5" />
       <span className="font-medium">Products Created Successfully!</span>
     </div>
-    <div className="text-sm text-muted-foreground">
-      Created {successCount} products in your Gelato store
-    </div>
+    <div className="text-sm text-muted-foreground">Created {successCount} products in your Gelato store</div>
   </div>
 ) : (
   <Button
     onClick={handleCreateProducts}
-    disabled={
-      !images.length ||
-      !selectedProduct ||
-      !isUuid(selectedProduct.id) // ← impedisce click se l’ID è un sample finto
-    }
+    disabled={!images.length || !selectedProduct}
     size="lg"
     className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
   >
