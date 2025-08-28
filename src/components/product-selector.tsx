@@ -53,26 +53,29 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
   const [showSamples, setShowSamples] = useState(true);
   const { toast } = useToast();
 
- const handleProductLoad = async () => {
+const handleProductLoad = async () => {
   if (!productId.trim()) return;
 
   setIsLoading(true);
   try {
-    // chiamiamo la GET /functions/v1/gelato-get-template?templateId=...
-    const tpl = await getTemplate(productId.trim());
+    console.log(`Fetching template ${productId} from Gelato API`);
 
+    // ⬇️ chiamata via GET con query string (coerente con la Edge)
+    const template: any = await getTemplate(productId);
+
+    // ⬇️ usa gli ID veri, non i titoli
     const product: Product = {
-      id: tpl.id, // UUID reale
-      name: tpl.title || productName || `Template ${productId}`,
-      type: tpl.productType || "apparel",
-      variants: (tpl.variants ?? []).map((v: any) => v.title) || ["Default"],
-      printAreas:
-        tpl.variants?.[0]?.imagePlaceholders?.map((p: any) => p.name) ||
-        tpl.imagePlaceholders?.map((p: any) => p.name) ||
-        ["front"],
+      id: template.id,
+      name: template.title || productName || `Template ${productId}`,
+      type: template.productType || "unknown",
+      variants: (template.variants ?? []).map((v: any) => v.id),
+      printAreas: (template.variants?.[0]?.imagePlaceholders ?? []).map(
+        (p: any) => p.name
+      ),
     };
 
     onProductSelect(product);
+    setShowSamples(false);
 
     toast({
       title: "Template loaded",
@@ -92,9 +95,22 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
 
 
   const handleSampleSelect = (product: Product) => {
-    onProductSelect(product);
-    setShowSamples(false);
-  };
+  // I sample servono solo come suggerimento visivo.
+  // Compiliamo il nome, ma NON selezioniamo un prodotto finto.
+  setProductName(product.name);
+  toast({
+    title: "Sample selected",
+    description:
+      "Ora incolla un vero Template ID Gelato qui sopra e clicca “Load Template”.",
+  });
+};
+
+const isGuidSelected =
+  !!selectedProduct &&
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
+    selectedProduct.id
+  );
+
 
   return (
     <div className="space-y-6">
@@ -207,7 +223,7 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
       )}
 
       {/* Selected Product Display */}
-      {selectedProduct && (
+      {isGuidSelected && (
         <Card className="border-success bg-success/5">
           <CardContent className="p-6">
             <div className="flex items-start space-x-4">

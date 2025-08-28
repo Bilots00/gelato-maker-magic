@@ -35,7 +35,7 @@ async function pollProductStatus(storeId: string, productId: string, apiKey: str
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      const response = await fetch(`https://api.gelato.com/v1/stores/${storeId}/products/${productId}`, {
+      const response = await fetch(`https://ecommerce.gelatoapis.com/v1/stores/${storeId}/products/${productId}`, {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
@@ -84,7 +84,7 @@ serve(async (req) => {
       console.log(`Creating product ${i + 1}/${products.length}: ${product.title}`);
 
       try {
-        const createResponse = await fetch(`https://api.gelato.com/v1/stores/${GELATO_STORE_ID}/products:create-from-template`, {
+        const createResponse = await fetch(`https://ecommerce.gelatoapis.com/v1/stores/${GELATO_STORE_ID}/products:create-from-template`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${GELATO_API_KEY}`,

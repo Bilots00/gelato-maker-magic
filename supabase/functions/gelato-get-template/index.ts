@@ -31,7 +31,7 @@ if (!templateId) {
 
     console.log(`Fetching template ${templateId} from Gelato API`);
 
-    const response = await fetch(`https://api.gelato.com/v1/templates/${templateId}`, {
+    const response = await fetch(`https://ecommerce.gelatoapis.com/v1/templates/${templateId}`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${GELATO_API_KEY}`,

@@ -132,6 +132,19 @@ const handleCreateProducts = async () => {
   setIsCreating(true);
   setCreationProgress(0);
 
+  // blocco opzionale: impedisce subito i sample non-UUID
+if (!isUuid(selectedProduct.id)) {
+  toast({
+    title: "Invalid template",
+    description:
+      "In Step 3 carica un vero Template ID Gelato (UUID) e premi “Load Template”.",
+    variant: "destructive",
+  });
+  setIsCreating(false);
+  return;
+}
+
+
   try {
     // 1) TemplateId da usare: UUID reale se già selezionato, altrimenti fallback ENV
     const FALLBACK_TEMPLATE_ID = import.meta.env.VITE_GELATO_TEMPLATE_ID as string | undefined;
@@ -263,51 +276,6 @@ const handleCreateProducts = async () => {
 };
 
 
-      console.log('Starting bulk product creation:', products);
-
-
-      const data = await bulkCreate({
-      templateId: selectedProduct.id,
-       publish: true, // o false, se vuoi solo creare in bozza
-      products
-       });
-
-      const results = data.results;
-
-      const successCount = results.filter((r: any) => r.status === 'active').length;
-      const errorCount = results.filter((r: any) => r.status === 'error').length;
-
-      console.log('Bulk creation results:', results);
-
-      setCreatedProducts(results);
-      setCreationProgress(100);
-      setIsCreating(false);
-
-      if (successCount > 0) {
-        toast({
-          title: "🎉 Products Created Successfully!",
-          description: `Created ${successCount} products in your Gelato store. ${errorCount > 0 ? `${errorCount} failed.` : ''}`,
-        });
-      } else {
-        toast({
-          title: "Product Creation Failed",
-          description: `Failed to create products. Check console for details.`,
-          variant: "destructive",
-        });
-      }
-
-    } catch (error) {
-      console.error('Error creating products:', error);
-      setIsCreating(false);
-      setCreationProgress(0);
-      toast({
-        title: "Error creating products",
-        description: error instanceof Error ? error.message : 'Failed to create products',
-        variant: "destructive",
-      });
-    }
-  };
-
   const completedSteps = [
     isConnected,
     images.length > 0,
@@ -426,7 +394,7 @@ const hasSuccess = successCount > 0;
                   </div>
                 </div>
 
-                {isCreating ? (
+{isCreating ? (
   <div className="space-y-4">
     <div className="flex items-center justify-center space-x-2">
       <Loader2 className="h-4 w-4 animate-spin" />
@@ -450,7 +418,11 @@ const hasSuccess = successCount > 0;
 ) : (
   <Button
     onClick={handleCreateProducts}
-    disabled={!images.length || !selectedProduct}
+    disabled={
+      !images.length ||
+      !selectedProduct ||
+      !isUuid(selectedProduct.id) // ← impedisce click se l’ID è un sample finto
+    }
     size="lg"
     className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
   >
@@ -458,6 +430,7 @@ const hasSuccess = successCount > 0;
     Create {images.length} Products
   </Button>
 )}
+
               </CardContent>
             </Card>
           </div>
