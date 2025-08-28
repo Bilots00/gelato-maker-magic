@@ -239,6 +239,10 @@ const products = await Promise.all(
     createdProducts.length > 0
   ].filter(Boolean).length;
 
+  // subito sopra al return(...)
+const successCount = createdProducts.filter((r: any) => r.status === 'active').length;
+const hasSuccess = successCount > 0;
+
   return (
     <div className="space-y-8">
       {/* Progress Overview */}
@@ -256,6 +260,7 @@ const products = await Promise.all(
           </p>
         </CardContent>
       </Card>
+      
 
       {/* Step 1: Connect to Gelato */}
       <StepCard
@@ -356,7 +361,17 @@ const products = await Promise.all(
                       {Math.round(creationProgress)}% complete
                     </p>
                   </div>
-                ) : createdProducts.length > 0 ? (
+                ) : hasSuccess ? (
+  <div className="space-y-4">
+    <div className="flex items-center justify-center space-x-2 text-success">
+      <CheckCircle className="h-5 w-5" />
+      <span className="font-medium">Products Created Successfully!</span>
+    </div>
+    <div className="text-sm text-muted-foreground">
+      Created {successCount} products in your Gelato store
+    </div>
+  </div>
+
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2 text-success">
                       <CheckCircle className="h-5 w-5" />
@@ -368,11 +383,12 @@ const products = await Promise.all(
                   </div>
                 ) : (
                   <Button
-                    onClick={handleCreateProducts}
-                    disabled={!images.length || !selectedProduct}
-                    size="lg"
-                    className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
-                  >
+  onClick={handleCreateProducts}
+  disabled={!images.length || !selectedProduct}
+  size="lg"
+  className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
+>
+
                     <Rocket className="h-4 w-4 mr-2" />
                     Create {images.length} Products
                   </Button>

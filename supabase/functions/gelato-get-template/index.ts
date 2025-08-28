@@ -17,12 +17,17 @@ serve(async (req) => {
       throw new Error('GELATO_API_KEY is not configured');
     }
 
-    const url = new URL(req.url);
-    const templateId = url.pathname.split('/').pop();
+    // ...
+const url = new URL(req.url);
+// PRIMA prendevi l'ultimo pezzo del path (sbagliato)
+// Ora leggiamo il query param ?templateId=...
+const templateId = url.searchParams.get("templateId");
 
-    if (!templateId) {
-      throw new Error('Template ID is required');
-    }
+if (!templateId) {
+  throw new Error("Template ID is required");
+}
+// ...
+
 
     console.log(`Fetching template ${templateId} from Gelato API`);
 
