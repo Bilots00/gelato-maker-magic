@@ -9,6 +9,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { getTemplate } from "@/lib/supabaseFetch";
 import { useToast } from "@/components/ui/use-toast";
 
+const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
+
 interface Product {
   id: string;
   name: string;
@@ -52,6 +54,8 @@ export function ProductSelector({ onProductSelect, selectedProduct }: ProductSel
   const [isLoading, setIsLoading] = useState(false);
   const [showSamples, setShowSamples] = useState(true);
   const { toast } = useToast();
+  const DEFAULT_TEMPLATE_ID = import.meta.env.VITE_GELATO_TEMPLATE_ID as string | undefined;
+
 
 const handleProductLoad = async () => {
   if (!productId.trim()) return;
@@ -101,16 +105,23 @@ const handleProductLoad = async () => {
 
 
 
-  const handleSampleSelect = (product: Product) => {
-  // I sample servono solo come suggerimento visivo.
-  // Compiliamo il nome, ma NON selezioniamo un prodotto finto.
-  setProductName(product.name);
-  toast({
-    title: "Sample selected",
-    description:
-      "Ora incolla un vero Template ID Gelato qui sopra e clicca “Load Template”.",
-  });
+  const handleSampleSelect = async (_sample: Product) => {
+  // Se hai messo un UUID comodo in .env (VITE_GELATO_TEMPLATE_ID),
+  // lo usiamo subito e carichiamo il template; altrimenti chiediamo all'utente.
+  if (DEFAULT_TEMPLATE_ID) {
+    setProductId(DEFAULT_TEMPLATE_ID);
+    await handleProductLoad();
+  } else {
+    setProductId("");
+    setShowSamples(true);
+    toast({
+      title: "Template ID required",
+      description: "Inserisci un vero Template ID Gelato (UUID) e premi “Load Template”.",
+      variant: "destructive",
+    });
+  }
 };
+
 
 const isGuidSelected =
   !!selectedProduct &&

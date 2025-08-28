@@ -249,10 +249,12 @@ if (!isUuid(selectedProduct.id)) {
 
     // 5) Chiamata alla Edge Function con UUID del template reale
     const data = await bulkCreate({
-      templateId: tpl.id,
-      publish: true,
-      products,
-    });
+  templateId: tpl.id,
+  publish: true,
+  products,
+  storeId: STORE_ID, // ⬅️ forza lo store in Edge
+});
+
 
     const results = data.results || [];
     console.log("Bulk creation results:", results);
