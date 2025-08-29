@@ -270,65 +270,60 @@ export function BulkCreator() {
       }
 
       // Prepara prodotti: per OGNI immagine, genera tutte le varianti del template
-      const products = await Promise.all(
-        images.map(async (image, index) => {
-          // titolo
-          let title = "";
-          if (rules.titleMode === "filename") title = image.name.replace(/\.[^/.]+$/, "");
-          else if (rules.titleMode === "ai-simple") title = `AI Generated Title ${index + 1}`;
-          else title = `Custom Product ${index + 1}`;
-          if (rules.includeCustomTitle && rules.titleCustomText) {
-            title += ` ${rules.titleCustomText}`;
-          }
+      const variantsPayload = await Promise.all(
+  tplVariants.map(async (v) => {
+    const placeholderName =
+      v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "front";
 
-          // Per ogni variante calcolo dimensioni in pixel (300 dpi se upscaling attivo)
-          const variantsPayload = await Promise.all(
-            tplVariants.map(async (v) => {
-              const placeholderName =
-                v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "front";
-             const inches = parseVariantInches(v.title) || [12, 16]; // fallback
-const DPI = processingOptions.upscale ? 300 : 150;
-const targetW = Math.round(inches[0] * DPI);
-const targetH = Math.round(inches[1] * DPI);
+    const inches = parseVariantInches(v.title) || [12, 16]; // fallback
+    const DPI = processingOptions.upscale ? 300 : 150;
+    const targetW = Math.round(inches[0] * DPI);
+    const targetH = Math.round(inches[1] * DPI);
 
-const transformed = await transformForVariant(
-  image.file,
-  targetW,
-  targetH,
-  processingOptions.fitMode,   // "stretch" => COVER
-  processingOptions.upscale
+    // 🔧 DICHIARA FUORI DALL'IF
+    let fileToUpload: File = image.file;
+
+    const transformed = await transformForVariant(
+      image.file,
+      targetW,
+      targetH,
+      processingOptions.fitMode,   // "stretch" | "preserve" | "exact"
+      processingOptions.upscale
+    );
+
+    if (transformed) {
+      const ext = image.file.type.includes("png")
+        ? "png"
+        : image.file.type.includes("webp")
+        ? "webp"
+        : "jpg";
+      const fname = image.name.replace(/\.[^/.]+$/, "");
+      fileToUpload = new File(
+        [transformed],
+        `${fname}-${targetW}x${targetH}.${ext}`,
+        { type: image.file.type || "image/png" }
+      );
+    }
+
+    const safeName = (fileToUpload.name || image.name)
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9.-]/g, "");
+
+    const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+    const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+
+    return {
+      templateVariantId: v.id,
+      imagePlaceholders: [
+        {
+          name: placeholderName,
+          fileUrl: publicUrl,
+        },
+      ],
+    };
+  })
 );
-
-              if (transformed) {
-                const ext = image.file.type.includes("png")
-                  ? "png"
-                  : image.file.type.includes("webp")
-                  ? "webp"
-                  : "jpg";
-                const fname = image.name.replace(/\.[^/.]+$/, "");
-                fileToUpload = new File([transformed], `${fname}-${targetW}x${targetH}.${ext}`, {
-                  type: image.file.type || "image/png",
-                });
-              }
-
-              const safeName = (fileToUpload.name || image.name)
-                .toLowerCase()
-                .replace(/\s+/g, "-")
-                .replace(/[^a-z0-9.-]/g, "");
-              const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
-              const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
-
-              return {
-                templateVariantId: v.id,
-                imagePlaceholders: [
-                  {
-                    name: placeholderName,
-                    fileUrl: publicUrl,
-                  },
-                ],
-              };
-            })
-          );
 
           return {
             title,
