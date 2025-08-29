@@ -86,17 +86,43 @@ function extFromType(t: string) {
   return t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg";
 }
 
+// Loader più robusto + revoke dell'URL per evitare leak
 async function fileToImage(file: File): Promise<HTMLImageElement> {
   const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.src = url;
-  await img.decode();
-  return img;
+  try {
+    const img = new Image();
+    img.src = url;
+    // decode() non è sempre supportato in tutti i formati, fallback a onload
+    if ("decode" in img) {
+      await (img as any).decode().catch(
+        () =>
+          new Promise<void>((res, rej) => {
+            img.onload = () => res();
+            img.onerror = (e) => rej(e);
+          })
+      );
+    } else {
+      await new Promise<void>((res, rej) => {
+        img.onload = () => res();
+        img.onerror = (e) => rej(e);
+      });
+    }
+    return img;
+  } finally {
+    // non revochiamo subito: Chrome a volte usa il blob ancora durante drawImage
+    // verrà garbage-collectato da solo; niente revoke immediato qui.
+  }
 }
 
-// stretch  -> FILL con distorsione (NO crop, NO aspect-ratio)
-// preserve -> CONTAIN + center (mantieni ratio; possibili bordi)
-// exact    -> nessuna trasformazione (usa file originale)
+/**
+ * stretch  -> riempi TUTTO distorcendo (NO crop, NO bordi)
+ * preserve -> contain + center (mantieni ratio, possibili bordi)
+ * exact    -> nessuna trasformazione
+ *
+ * Protezioni anti "EncodingError":
+ * - limite dimensione massima canvas (larghezza/altezza/pixel totali)
+ * - scala sicura anche quando upscale=true
+ */
 async function transformForVariant(
   file: File,
   targetW: number,
@@ -110,15 +136,27 @@ async function transformForVariant(
   const type = file.type || "image/png";
   const ext = extFromType(type);
 
-  // Mantieni SEMPRE il ratio del target (print area).
-  // Se non voglio upscalare, riduco entrambi i lati con lo stesso fattore.
-  const scale = upscale
-    ? 1
-    : Math.min(
-        1,
-        Math.min(img.naturalWidth / targetW, img.naturalHeight / targetH)
-      );
+  // Limiti "safe" per Canvas (puoi alzarli se la tua macchina regge)
+  const MAX_W = 8192;                 // lim. per lato
+  const MAX_H = 8192;
+  const MAX_PIXELS = 48_000_000;      // ~48 MP
 
+  // Scala base: mantieni sempre il ratio della PRINT AREA (targetW:targetH).
+  // Se non fai upscale, riduci in base all'immagine sorgente.
+  const scaleBySource = Math.min(
+    img.naturalWidth / targetW,
+    img.naturalHeight / targetH
+  );
+
+  // Con upscale=true posso arrivare a 1, con upscale=false non supero la sorgente
+  let scale = upscale ? 1 : Math.min(1, scaleBySource);
+
+  // Applica cap per non superare i limiti del canvas
+  const capBySide = Math.min(MAX_W / targetW, MAX_H / targetH, 1);
+  const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (targetW * targetH)));
+  const safeCap = Math.min(capBySide, capByPixels);
+
+  scale = Math.min(scale, safeCap);
   const canvasW = Math.max(1, Math.round(targetW * scale));
   const canvasH = Math.max(1, Math.round(targetH * scale));
 
@@ -129,19 +167,17 @@ async function transformForVariant(
   ctx.clearRect(0, 0, canvasW, canvasH);
 
   if (fitMode === "stretch") {
-    // === STRETCH: riempi TUTTO distorcendo (nessun crop, nessun bordo) ===
+    // === STRETCH: distorsione piena per riempire, NES-SUN CROP ===
     ctx.drawImage(img, 0, 0, canvasW, canvasH);
   } else {
-    // === PRESERVE: contain + center (mantieni AR; possibili bande) ===
+    // === PRESERVE: contain + center ===
     const srcR = img.naturalWidth / img.naturalHeight;
     const dstR = canvasW / canvasH;
     let drawW: number, drawH: number;
     if (srcR > dstR) {
-      // limito per larghezza
       drawW = canvasW;
       drawH = Math.round(canvasW / srcR);
     } else {
-      // limito per altezza
       drawH = canvasH;
       drawW = Math.round(canvasH * srcR);
     }
@@ -151,13 +187,21 @@ async function transformForVariant(
   }
 
   const quality = /jpe?g/i.test(type) ? 0.92 : 1;
-  return await new Promise<Blob>((res) =>
+
+  // toBlob può comunque fallire: catturiamo e segnaliamo
+  return await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
-      (b) => res(b!),
+      (b) => {
+        if (!b) {
+          reject(new DOMException("Canvas encoding failed", "EncodingError"));
+        } else {
+          resolve(b);
+        }
+      },
       type.includes("image/") ? type : `image/${ext}`,
       quality
-    )
-  );
+    );
+  });
 }
 
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
