@@ -64,15 +64,15 @@ const defaultRules: ProductRulesType = {
 const isUuid = (s?: string) =>
   !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
-// ---------- helpers: DPI, parse variant, canvas transforms ----------
+// --- helpers: parse variant title -> inches ---
 const INCH_PER_CM = 1 / 2.54;
 
 function parseVariantInches(title?: string): [number, number] | null {
   if (!title) return null;
-  // "12x16 in - 30x40 cm"  -> prendo i valori in pollici se presenti
+  // es: "12x16 in - 30x40 cm"
   const mIn = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*in/i);
   if (mIn) return [parseFloat(mIn[1]), parseFloat(mIn[2])];
-  // altrimenti provo i cm
+
   const mCm = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*cm/i);
   if (mCm) {
     const w = parseFloat(mCm[1]) * INCH_PER_CM;
@@ -88,23 +88,15 @@ function extFromType(t: string) {
 
 async function fileToImage(file: File): Promise<HTMLImageElement> {
   const url = URL.createObjectURL(file);
-  try {
-    await new Promise<void>((res, rej) => {
-      const img = new Image();
-      img.onload = () => res();
-      img.onerror = rej;
-      img.src = url;
-    });
-  } catch {}
   const img = new Image();
   img.src = url;
   await img.decode();
   return img;
 }
 
-// stretch -> deforma per riempire
-// preserve -> contain centrato con letterbox trasparente
-// exact -> non toccare (ritorna null per segnalare "usa file originale")
+// stretch  = COVER (riempi, tagli se serve, nessun bordo, no distorsione)
+// preserve = CONTAIN (mantieni ratio e centra; possibili bordi)
+// exact    = salta trasformazione (usa file originale)
 async function transformForVariant(
   file: File,
   targetW: number,
@@ -118,7 +110,7 @@ async function transformForVariant(
   const type = file.type || "image/png";
   const ext = extFromType(type);
 
-  // se non voglio upscalare, limito ai pixel originali
+  // calcolo dimensioni canvas
   const canvasW = upscale ? Math.round(targetW) : Math.min(Math.round(targetW), img.naturalWidth);
   const canvasH = upscale ? Math.round(targetH) : Math.min(Math.round(targetH), img.naturalHeight);
 
@@ -128,33 +120,45 @@ async function transformForVariant(
   const ctx = canvas.getContext("2d")!;
   ctx.clearRect(0, 0, canvasW, canvasH);
 
-  if (fitMode === "stretch") {
-    // deforma per riempire completamente
-    ctx.drawImage(img, 0, 0, canvasW, canvasH);
-  } else {
-    // preserve -> contain + center
-    const srcR = img.naturalWidth / img.naturalHeight;
-    const dstR = canvasW / canvasH;
+  const srcR = img.naturalWidth / img.naturalHeight;
+  const dstR = canvasW / canvasH;
 
-    let drawW = canvasW;
-    let drawH = canvasH;
+  let drawW: number, drawH: number, dx: number, dy: number;
+
+  if (fitMode === "stretch") {
+    // COVER (riempi tutto, tagli se necessario – niente bordi)
     if (srcR > dstR) {
-      // limito per larghezza
+      // immagine "più larga" -> adatto per altezza, poi croppo ai lati
+      drawH = canvasH;
+      drawW = Math.round(canvasH * srcR);
+    } else {
+      // immagine "più alta" -> adatto per larghezza, poi croppo sopra/sotto
+      drawW = canvasW;
+      drawH = Math.round(canvasW / srcR);
+    }
+    dx = Math.round((canvasW - drawW) / 2);
+    dy = Math.round((canvasH - drawH) / 2);
+  } else {
+    // PRESERVE (contain + center)
+    if (srcR > dstR) {
       drawW = canvasW;
       drawH = Math.round(canvasW / srcR);
     } else {
-      // limito per altezza
       drawH = canvasH;
       drawW = Math.round(canvasH * srcR);
     }
-    const dx = Math.round((canvasW - drawW) / 2);
-    const dy = Math.round((canvasH - drawH) / 2);
-    ctx.drawImage(img, dx, dy, drawW, drawH);
+    dx = Math.round((canvasW - drawW) / 2);
+    dy = Math.round((canvasH - drawH) / 2);
   }
 
+  ctx.drawImage(img, dx, dy, drawW, drawH);
+
   const quality = type.includes("jpeg") || type.includes("jpg") ? 0.92 : 1;
-  return await new Promise<Blob>((res) => canvas.toBlob((b) => res(b!), type.includes("image/") ? type : `image/${ext}`, quality));
+  return await new Promise<Blob>((res) =>
+    canvas.toBlob((b) => res(b!), type.includes("image/") ? type : `image/${ext}`, quality)
+  );
 }
+
 
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
   const { data, error } = await supabase.storage.from("designs").upload(destPath, input, {
@@ -282,20 +286,19 @@ export function BulkCreator() {
             tplVariants.map(async (v) => {
               const placeholderName =
                 v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "front";
-              const inches = parseVariantInches(v.title) || [12, 16]; // fallback 12x16
-              const DPI = processingOptions.upscale ? 300 : 150;
-              const targetW = Math.round(inches[0] * DPI);
-              const targetH = Math.round(inches[1] * DPI);
+             const inches = parseVariantInches(v.title) || [12, 16]; // fallback
+const DPI = processingOptions.upscale ? 300 : 150;
+const targetW = Math.round(inches[0] * DPI);
+const targetH = Math.round(inches[1] * DPI);
 
-              // trasformo (stretch/preserve/exact) ed eventualmente re-upload
-              let fileToUpload: File = image.file;
-              const transformed = await transformForVariant(
-                image.file,
-                targetW,
-                targetH,
-                processingOptions.fitMode,
-                processingOptions.upscale
-              );
+const transformed = await transformForVariant(
+  image.file,
+  targetW,
+  targetH,
+  processingOptions.fitMode,   // "stretch" => COVER
+  processingOptions.upscale
+);
+
               if (transformed) {
                 const ext = image.file.type.includes("png")
                   ? "png"
