@@ -94,9 +94,9 @@ async function fileToImage(file: File): Promise<HTMLImageElement> {
   return img;
 }
 
-// stretch  = COVER (riempi, tagli se serve, nessun bordo, no distorsione)
-// preserve = CONTAIN (mantieni ratio e centra; possibili bordi)
-// exact    = salta trasformazione (usa file originale)
+// stretch  -> FILL con distorsione (NO crop, NO aspect-ratio)
+// preserve -> CONTAIN + center (mantieni ratio; possibili bordi)
+// exact    -> nessuna trasformazione (usa file originale)
 async function transformForVariant(
   file: File,
   targetW: number,
@@ -110,9 +110,17 @@ async function transformForVariant(
   const type = file.type || "image/png";
   const ext = extFromType(type);
 
-  // calcolo dimensioni canvas
-  const canvasW = upscale ? Math.round(targetW) : Math.min(Math.round(targetW), img.naturalWidth);
-  const canvasH = upscale ? Math.round(targetH) : Math.min(Math.round(targetH), img.naturalHeight);
+  // Mantieni SEMPRE il ratio del target (print area).
+  // Se non voglio upscalare, riduco entrambi i lati con lo stesso fattore.
+  const scale = upscale
+    ? 1
+    : Math.min(
+        1,
+        Math.min(img.naturalWidth / targetW, img.naturalHeight / targetH)
+      );
+
+  const canvasW = Math.max(1, Math.round(targetW * scale));
+  const canvasH = Math.max(1, Math.round(targetH * scale));
 
   const canvas = document.createElement("canvas");
   canvas.width = canvasW;
@@ -120,45 +128,37 @@ async function transformForVariant(
   const ctx = canvas.getContext("2d")!;
   ctx.clearRect(0, 0, canvasW, canvasH);
 
-  const srcR = img.naturalWidth / img.naturalHeight;
-  const dstR = canvasW / canvasH;
-
-  let drawW: number, drawH: number, dx: number, dy: number;
-
   if (fitMode === "stretch") {
-    // COVER (riempi tutto, tagli se necessario – niente bordi)
-    if (srcR > dstR) {
-      // immagine "più larga" -> adatto per altezza, poi croppo ai lati
-      drawH = canvasH;
-      drawW = Math.round(canvasH * srcR);
-    } else {
-      // immagine "più alta" -> adatto per larghezza, poi croppo sopra/sotto
-      drawW = canvasW;
-      drawH = Math.round(canvasW / srcR);
-    }
-    dx = Math.round((canvasW - drawW) / 2);
-    dy = Math.round((canvasH - drawH) / 2);
+    // === STRETCH: riempi TUTTO distorcendo (nessun crop, nessun bordo) ===
+    ctx.drawImage(img, 0, 0, canvasW, canvasH);
   } else {
-    // PRESERVE (contain + center)
+    // === PRESERVE: contain + center (mantieni AR; possibili bande) ===
+    const srcR = img.naturalWidth / img.naturalHeight;
+    const dstR = canvasW / canvasH;
+    let drawW: number, drawH: number;
     if (srcR > dstR) {
+      // limito per larghezza
       drawW = canvasW;
       drawH = Math.round(canvasW / srcR);
     } else {
+      // limito per altezza
       drawH = canvasH;
       drawW = Math.round(canvasH * srcR);
     }
-    dx = Math.round((canvasW - drawW) / 2);
-    dy = Math.round((canvasH - drawH) / 2);
+    const dx = Math.round((canvasW - drawW) / 2);
+    const dy = Math.round((canvasH - drawH) / 2);
+    ctx.drawImage(img, dx, dy, drawW, drawH);
   }
 
-  ctx.drawImage(img, dx, dy, drawW, drawH);
-
-  const quality = type.includes("jpeg") || type.includes("jpg") ? 0.92 : 1;
+  const quality = /jpe?g/i.test(type) ? 0.92 : 1;
   return await new Promise<Blob>((res) =>
-    canvas.toBlob((b) => res(b!), type.includes("image/") ? type : `image/${ext}`, quality)
+    canvas.toBlob(
+      (b) => res(b!),
+      type.includes("image/") ? type : `image/${ext}`,
+      quality
+    )
   );
 }
-
 
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
   const { data, error } = await supabase.storage.from("designs").upload(destPath, input, {
@@ -217,7 +217,7 @@ export function BulkCreator() {
 
   const handleImagesChange = (newImages: ImageFile[]) => {
     setImages(newImages);
-    // FIX: avanza sempre almeno allo step 3 (niente più freeze)
+    // avanza almeno allo step 3
     setCurrentStep((prev) => (newImages.length > 0 ? Math.max(prev, 3) : prev));
   };
 
@@ -270,108 +270,100 @@ export function BulkCreator() {
       }
 
       // Prepara prodotti: per OGNI immagine, genera tutte le varianti del template
-const products = await Promise.all(
-  images.map(async (image, index) => {
-    // 1) Titolo
-    let title: string;
-    if (rules.titleMode === "filename") {
-      title = image.name.replace(/\.[^/.]+$/, "");
-    } else if (rules.titleMode === "ai-simple") {
-      title = `AI Generated Title ${index + 1}`;
-    } else {
-      title = `Custom Product ${index + 1}`;
-    }
-    if (rules.includeCustomTitle && rules.titleCustomText) {
-      title += ` ${rules.titleCustomText}`;
-    }
+      const products = await Promise.all(
+        images.map(async (image, index) => {
+          // 1) Titolo
+          let title: string;
+          if (rules.titleMode === "filename") {
+            title = image.name.replace(/\.[^/.]+$/, "");
+          } else if (rules.titleMode === "ai-simple") {
+            title = `AI Generated Title ${index + 1}`;
+          } else {
+            title = `Custom Product ${index + 1}`;
+          }
+          if (rules.includeCustomTitle && rules.titleCustomText) {
+            title += ` ${rules.titleCustomText}`;
+          }
 
-    // 2) Per ogni variante calcolo dimensioni target e preparo l'upload
-    const variantsPayload = await Promise.all(
-      tplVariants.map(async (v: any) => {
-        const placeholderName =
-          v?.imagePlaceholders?.[0]?.name ||
-          tpl?.imagePlaceholders?.[0]?.name ||
-          "front";
+          // 2) Per ogni variante calcolo dimensioni target e preparo l'upload
+          const variantsPayload = await Promise.all(
+            tplVariants.map(async (v: any) => {
+              const placeholderName =
+                v?.imagePlaceholders?.[0]?.name ||
+                tpl?.imagePlaceholders?.[0]?.name ||
+                "front";
 
-        const inches = parseVariantInches(v?.title) || [12, 16]; // fallback
-        const DPI = processingOptions.upscale ? 300 : 150;
-        const targetW = Math.round(inches[0] * DPI);
-        const targetH = Math.round(inches[1] * DPI);
+              const inches = parseVariantInches(v?.title) || [12, 16]; // fallback
+              const DPI = processingOptions.upscale ? 300 : 150;
+              const targetW = Math.round(inches[0] * DPI);
+              const targetH = Math.round(inches[1] * DPI);
 
-        // 🔧 Deve esistere anche fuori dall'if
-        let fileToUpload: File = image.file;
+              // Deve esistere anche fuori dall'if
+              let fileToUpload: File = image.file;
 
-        // "stretch" = riempi deformando, "preserve" = contain + centering, "exact" = usa originale
-        const transformed = await transformForVariant(
-          image.file,
-          targetW,
-          targetH,
-          processingOptions.fitMode,   // "stretch" | "preserve" | "exact"
-          processingOptions.upscale
-        );
+              // "stretch" = distorsione piena, "preserve" = contain + centering, "exact" = usa originale
+              const transformed = await transformForVariant(
+                image.file,
+                targetW,
+                targetH,
+                processingOptions.fitMode,   // "stretch" | "preserve" | "exact"
+                processingOptions.upscale
+              );
 
-        if (transformed) {
-          const baseType = image.file.type || "image/png";
-          const ext = baseType.includes("png")
-            ? "png"
-            : baseType.includes("webp")
-            ? "webp"
-            : baseType.includes("jpeg") || baseType.includes("jpg")
-            ? "jpg"
-            : "png";
+              if (transformed) {
+                const baseType = image.file.type || "image/png";
+                const ext =
+                  baseType.includes("png") ? "png" :
+                  baseType.includes("webp") ? "webp" :
+                  (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
 
-          const fname = image.name.replace(/\.[^/.]+$/, "");
-          fileToUpload = new File(
-            [transformed],
-            `${fname}-${targetW}x${targetH}.${ext}`,
-            { type: baseType }
+                const fname = image.name.replace(/\.[^/.]+$/, "");
+                fileToUpload = new File(
+                  [transformed],
+                  `${fname}-${targetW}x${targetH}.${ext}`,
+                  { type: baseType }
+                );
+              }
+
+              const safeName = (fileToUpload.name || image.name)
+                .toLowerCase()
+                .replace(/\s+/g, "-")
+                .replace(/[^a-z0-9.-]/g, "");
+
+              const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+              const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+
+              return {
+                templateVariantId: v.id,
+                imagePlaceholders: [
+                  {
+                    name: placeholderName,
+                    fileUrl: publicUrl,
+                  },
+                ],
+              };
+            })
           );
-        }
 
-        const safeName = (fileToUpload.name || image.name)
-          .toLowerCase()
-          .replace(/\s+/g, "-")
-          .replace(/[^a-z0-9.-]/g, "");
+          return {
+            title,
+            description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
+            tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
+            variants: variantsPayload, // <— tutte le varianti del template
+          };
+        })
+      );
 
-        const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
-        const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
-
-        return {
-          templateVariantId: v.id,
-          imagePlaceholders: [
-            {
-              name: placeholderName,
-              fileUrl: publicUrl,
-            },
-          ],
-        };
-      })
-    );
-
-    return {
-      title,
-      description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
-      tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
-      variants: variantsPayload, // <— tutte le varianti del template
-    };
-  })
-);
-
-
-      console.log("Starting bulk product creation:", products);
-
-      // Passo anche salesChannels se vuoi “View in Shopify”
+      // invio alla edge
       const data = await bulkCreate({
         templateId: tpl.id,
         publish: true,
         products,
         storeId: STORE_ID,
-        salesChannels: ["shopify"], // o ["web"] se preferisci
+        salesChannels: ["shopify"],
       });
 
       const results = data.results || [];
-      console.log("Bulk creation results:", results);
-
       setCreatedProducts(results);
       setCreationProgress(100);
       setIsCreating(false);
@@ -403,8 +395,7 @@ const products = await Promise.all(
     }
   };
 
-  const completedSteps = [isConnected, images.length > 0, !!selectedProduct, createdProducts.length > 0].filter(Boolean)
-    .length;
+  const completedSteps = [isConnected, images.length > 0, !!selectedProduct, createdProducts.length > 0].filter(Boolean).length;
   const successCount = createdProducts.filter((r: any) => r.status === "active").length;
   const hasSuccess = successCount > 0;
 
