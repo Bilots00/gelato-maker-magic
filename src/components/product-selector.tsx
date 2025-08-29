@@ -8,6 +8,9 @@ import { ExternalLink, Package, Plus, Loader2 } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { getTemplate } from "@/lib/supabaseFetch";
 import { useToast } from "@/components/ui/use-toast";
+import { supabase } from "@/integrations/supabase/client";
+
+
 
 const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
 

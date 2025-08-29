@@ -13,7 +13,7 @@ import { useToast } from "@/hooks/use-toast";
 import { bulkCreate, getTemplate } from "@/lib/supabaseFetch";
 import { supabase } from "@/integrations/supabase/client";
 
-const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
+   const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
 
 interface ImageFile {
   id: string;
@@ -249,13 +249,13 @@ if (!isUuid(selectedProduct.id)) {
     console.log("Starting bulk product creation:", products);
 
     // 5) Chiamata alla Edge Function con UUID del template reale
-    const data = await bulkCreate({
+  const data = await bulkCreate({
   templateId: tpl.id,
   publish: true,
   products,
-  storeId: STORE_ID, // ⬅️ forza lo store in Edge
+  storeId: STORE_ID,           // ✅ passa lo storeId (se non lo passi userà quello nei secrets)
+  salesChannels: ["shopify"],  // ✅ se vuoi vedere “View in Shopify”; altrimenti ["web"]
 });
-
 
     const results = data.results || [];
     console.log("Bulk creation results:", results);
