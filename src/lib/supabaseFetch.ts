@@ -1,22 +1,20 @@
-// src/lib/supabaseFetch.ts
-const BASE = import.meta.env.VITE_SUPABASE_URL as string;
-const ANON = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const CLOUDFLARE_WORKER_URL = "https://gelato-backend.andrea-bilotta00.workers.dev";
 
-if (!BASE || !ANON) {
-  console.warn('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY');
-}
-
-export async function supabaseFetch<T = any>(
+export async function workerFetch<T = any>(
   path: string,
   init: RequestInit = {}
 ): Promise<T> {
-  const headers = new Headers(init.headers ?? {});
-  headers.set('Authorization', `Bearer ${ANON}`);
-  if (init.method && init.method !== 'GET' && !headers.has('Content-Type')) {
-    headers.set('Content-Type', 'application/json');
-  }
+  // Rimuoviamo eventuali slash doppi se il path inizia con /
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  
+  const res = await fetch(`${CLOUDFLARE_WORKER_URL}${cleanPath}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...init.headers,
+    },
+  });
 
-  const res = await fetch(`${BASE}${path}`, { ...init, headers });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`${res.status} ${res.statusText} – ${text}`);
@@ -25,10 +23,10 @@ export async function supabaseFetch<T = any>(
 }
 
 export const getTemplate = (templateId: string) =>
-  supabaseFetch(`/functions/v1/gelato-get-template?templateId=${encodeURIComponent(templateId)}`);
+  workerFetch(`/gelato-get-template?templateId=${encodeURIComponent(templateId)}`);
 
-export const bulkCreate = (payload: unknown) =>
-  supabaseFetch(`/functions/v1/gelato-bulk-create`, {
+export const bulkCreate = (payload: any) =>
+  workerFetch(`/gelato-bulk-create`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });
