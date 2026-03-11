@@ -11,7 +11,6 @@ import { Progress } from "@/components/ui/progress";
 import { CheckCircle, Loader2, Package, Rocket } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { bulkCreate, getTemplate } from "@/lib/supabaseFetch";
-import { supabase } from "@/integrations/supabase/client";
 
 const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
 
@@ -205,14 +204,24 @@ async function transformForVariant(
 }
 
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const { data, error } = await supabase.storage.from("designs").upload(destPath, input, {
-    upsert: true,
-    contentType: input.type || "image/png",
-    cacheControl: "3600",
+  const formData = new FormData();
+  // Passiamo anche il destPath come nome file per mantenere la logica invariata
+  formData.append("file", input, destPath.split('/').pop());
+
+  // Chiama il tuo nuovo Worker su Cloudflare
+  const uploadRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/upload", {
+    method: "POST",
+    body: formData
   });
-  if (error) throw error;
-  const { data: pub } = supabase.storage.from("designs").getPublicUrl(data.path);
-  return pub.publicUrl;
+
+  if (!uploadRes.ok) {
+    const errorText = await uploadRes.text();
+    console.error("Cloudflare upload error:", errorText);
+    throw new Error("Errore durante il caricamento dell'immagine su Cloudflare R2");
+  }
+
+  const cloudflareData = await uploadRes.json();
+  return cloudflareData.url; // Questo è il tuo link pubblico .r2.dev!
 }
 
 // ---------- componente ----------
