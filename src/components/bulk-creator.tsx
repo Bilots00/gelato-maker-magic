@@ -179,14 +179,16 @@ async function transformForVariant(
 }
 
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const formData = new FormData();
-  // Passiamo anche il destPath come nome file per mantenere la logica invariata
-  formData.append("file", input, destPath.split('/').pop());
-
-  // Chiama il tuo nuovo Worker su Cloudflare
-  const uploadRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/upload", {
+  const fileName = destPath.split('/').pop() || "image.png";
+  
+  // INVIA I BYTE PURI, NON USARE FORMDATA!
+  // Passiamo il nome del file nell'URL così il Worker lo legge da lì
+  const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(fileName)}`, {
     method: "POST",
-    body: formData
+    headers: {
+      "Content-Type": input.type || "application/octet-stream"
+    },
+    body: input // <- Passiamo direttamente il File/Blob
   });
 
   if (!uploadRes.ok) {
@@ -196,7 +198,7 @@ async function uploadAndGetPublicUrl(input: File, destPath: string) {
   }
 
   const cloudflareData = await uploadRes.json();
-  return cloudflareData.url; // Questo è il tuo link pubblico .r2.dev!
+  return cloudflareData.url; 
 }
 
 // ---------- componente ----------
@@ -281,13 +283,16 @@ export function BulkCreator() {
         setIsCreating(false);
         toast({
           title: "Template ID mancante",
-          description: "Inserisci un Template ID Gelato (UUID) oppure configura VITE_GELATO_TEMPLATE_ID.",
+          description: "Inserisci un Template ID Gelato (UUID)",
           variant: "destructive",
         });
         return;
       }
 
-      const tpl = await getTemplate(chosenTemplateId);
+      // CHIAMATA DIRETTA AL CLOUDFLARE WORKER (Invece di Supabase)
+      const tplRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/gelato-get-template?templateId=${chosenTemplateId}`);
+      if (!tplRes.ok) throw new Error("Errore nel download del Template da Gelato");
+      const tpl = await tplRes.json();
       setTemplate(tpl);
 
       const tplVariants: any[] = tpl?.variants ?? [];
@@ -297,7 +302,7 @@ export function BulkCreator() {
         return;
       }
 
-      // VERO FIX: Array processati SEQUENZIALMENTE invece che in parallelo con Promise.all
+      // VERO FIX: Array processati SEQUENZIALMENTE
       const products = [];
       let processedImages = 0;
 
@@ -317,7 +322,7 @@ export function BulkCreator() {
           title += ` ${rules.titleCustomText}`;
         }
 
-        // 2) Cicla in SEQUENZA le varianti, liberando la RAM ad ogni step
+        // 2) Cicla in SEQUENZA le varianti
         const variantsPayload = [];
         for (const v of tplVariants) {
           const placeholderName =
@@ -362,7 +367,7 @@ export function BulkCreator() {
 
           const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
           
-          // Upload su Cloudflare in attesa prima di passare al successivo Canvas
+          // Upload su Cloudflare in RAW form
           const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
 
           variantsPayload.push({
@@ -383,20 +388,26 @@ export function BulkCreator() {
           variants: variantsPayload,
         });
 
-        // Aggiorna progress bar per ogni immagine completata
         processedImages++;
-        setCreationProgress((processedImages / images.length) * 50); // Mettiamo il 50% max fino alla bulk creation vera
+        setCreationProgress((processedImages / images.length) * 50); 
       }
 
-      // 3) Una volta generate sequenzialmente tutte le immagini su R2, chiama l'API Gelato (Worker)
-      const data = await bulkCreate({
-        templateId: tpl.id,
-        publish: true,
-        products,
-        storeId: STORE_ID,
-        salesChannels: ["shopify"],
+      // 3) CHIAMATA DIRETTA AL WORKER PER IL BULK CREATE (bypassa Supabase)
+      const createRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/gelato-bulk-create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          templateId: tpl.id,
+          publish: true,
+          products,
+          storeId: STORE_ID,
+          salesChannels: ["shopify"],
+        })
       });
 
+      if (!createRes.ok) throw new Error("Errore durante la creazione dei prodotti via Cloudflare");
+      
+      const data = await createRes.json();
       const results = data.results || [];
       setCreatedProducts(results);
       setCreationProgress(100);
