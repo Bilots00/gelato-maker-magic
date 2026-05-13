@@ -10,15 +10,9 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { CheckCircle, Loader2, Package, Rocket } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-// NOTA: Abbiamo rimosso 'bulkCreate' da qui per usare la chiamata diretta al Worker e tracciarla
-import { getTemplate } from "@/lib/supabaseFetch"; 
+import { bulkCreate, getTemplate } from "@/lib/supabaseFetch";
 
 const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
-
-// ==========================================
-// 🔴 INSERISCI QUI IL TUO LINK WEBHOOK.SITE 
-// ==========================================
-const DEBUG_WEBHOOK_URL = "https://webhook.site/82ab22e8-01b3-41e2-adfa-b115a70ba931"; // Es: "https://webhook.site/tuo-codice-uuid-qui"
 
 type ImageFile = {
   id: string;
@@ -52,14 +46,14 @@ type ProductRulesType = {
 };
 
 const defaultRules: ProductRulesType = {
-  titleMode: "filename", 
+  titleMode: "filename", // <-- CAMBIATO DA "ai-simple"
   titleMaxWords: 8,
   titleCustomText: "",
-  descriptionMode: "copy", 
+  descriptionMode: "copy", // <-- CAMBIATO DA "ai"
   descriptionParagraphs: 2,
   descriptionSentences: 3,
   descriptionCustomHTML: "",
-  tagsMode: "copy", 
+  tagsMode: "copy", // <-- CAMBIATO DA "ai"
   tagsMaxCount: 10,
   tagsCustom: [],
   includeCustomTitle: false,
@@ -69,10 +63,12 @@ const defaultRules: ProductRulesType = {
 const isUuid = (s?: string) =>
   !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
+// --- helpers: parse variant title -> inches ---
 const INCH_PER_CM = 1 / 2.54;
 
 function parseVariantInches(title?: string): [number, number] | null {
   if (!title) return null;
+  // es: "12x16 in - 30x40 cm"
   const mIn = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*in/i);
   if (mIn) return [parseFloat(mIn[1]), parseFloat(mIn[2])];
 
@@ -89,11 +85,13 @@ function extFromType(t: string) {
   return t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg";
 }
 
+// Loader più robusto + revoke dell'URL per evitare leak
 async function fileToImage(file: File): Promise<HTMLImageElement> {
   const url = URL.createObjectURL(file);
   try {
     const img = new Image();
     img.src = url;
+    // decode() non è sempre supportato in tutti i formati, fallback a onload
     if ("decode" in img) {
       await (img as any).decode().catch(
         () =>
@@ -109,9 +107,21 @@ async function fileToImage(file: File): Promise<HTMLImageElement> {
       });
     }
     return img;
-  } finally {}
+  } finally {
+    // non revochiamo subito: Chrome a volte usa il blob ancora durante drawImage
+    // verrà garbage-collectato da solo; niente revoke immediato qui.
+  }
 }
 
+/**
+ * stretch  -> riempi TUTTO distorcendo (NO crop, NO bordi)
+ * preserve -> contain + center (mantieni ratio, possibili bordi)
+ * exact    -> nessuna trasformazione
+ *
+ * Protezioni anti "EncodingError":
+ * - limite dimensione massima canvas (larghezza/altezza/pixel totali)
+ * - scala sicura anche quando upscale=true
+ */
 async function transformForVariant(
   file: File,
   targetW: number,
@@ -125,13 +135,22 @@ async function transformForVariant(
   const type = file.type || "image/png";
   const ext = extFromType(type);
 
-  const MAX_W = 8192;
+  // Limiti "safe" per Canvas (puoi alzarli se la tua macchina regge)
+  const MAX_W = 8192;                 // lim. per lato
   const MAX_H = 8192;
-  const MAX_PIXELS = 48_000_000;
+  const MAX_PIXELS = 48_000_000;      // ~48 MP
 
-  const scaleBySource = Math.min(img.naturalWidth / targetW, img.naturalHeight / targetH);
+  // Scala base: mantieni sempre il ratio della PRINT AREA (targetW:targetH).
+  // Se non fai upscale, riduci in base all'immagine sorgente.
+  const scaleBySource = Math.min(
+    img.naturalWidth / targetW,
+    img.naturalHeight / targetH
+  );
+
+  // Con upscale=true posso arrivare a 1, con upscale=false non supero la sorgente
   let scale = upscale ? 1 : Math.min(1, scaleBySource);
 
+  // Applica cap per non superare i limiti del canvas
   const capBySide = Math.min(MAX_W / targetW, MAX_H / targetH, 1);
   const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (targetW * targetH)));
   const safeCap = Math.min(capBySide, capByPixels);
@@ -147,8 +166,10 @@ async function transformForVariant(
   ctx.clearRect(0, 0, canvasW, canvasH);
 
   if (fitMode === "stretch") {
+    // === STRETCH: distorsione piena per riempire, NES-SUN CROP ===
     ctx.drawImage(img, 0, 0, canvasW, canvasH);
   } else {
+    // === PRESERVE: contain + center ===
     const srcR = img.naturalWidth / img.naturalHeight;
     const dstR = canvasW / canvasH;
     let drawW: number, drawH: number;
@@ -166,11 +187,15 @@ async function transformForVariant(
 
   const quality = /jpe?g/i.test(type) ? 0.92 : 1;
 
+  // toBlob può comunque fallire: catturiamo e segnaliamo
   return await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
       (b) => {
-        if (!b) reject(new DOMException("Canvas encoding failed", "EncodingError"));
-        else resolve(b);
+        if (!b) {
+          reject(new DOMException("Canvas encoding failed", "EncodingError"));
+        } else {
+          resolve(b);
+        }
       },
       type.includes("image/") ? type : `image/${ext}`,
       quality
@@ -178,145 +203,28 @@ async function transformForVariant(
   });
 }
 
-// 🚀 UPLOAD OTTIMIZZATO SENZA ALCUN LIMITE DI DIMENSIONE (VIA CHUNKS R2)
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const safeFileName = destPath.split('/').pop() || `image-${Date.now()}.jpg`;
-  const finalFileName = `uploads/${Date.now()}-${safeFileName}`;
-  console.log(`[UPLOAD] 📤 Inizio invio file: ${finalFileName} | Dimensione: ${(input.size / (1024*1024)).toFixed(2)} MB`);
-  
-  const CHUNK_SIZE = 50 * 1024 * 1024; // Affetta a pacchetti da 50MB
-  const WORKER_URL = "https://gelato-backend.andrea-bilotta00.workers.dev"; // Assicurati che l'URL sia corretto
+  const formData = new FormData();
+  // Passiamo anche il destPath come nome file per mantenere la logica invariata
+  formData.append("file", input, destPath.split('/').pop());
 
-  // ==========================================
-  // SE IL FILE E' GIGANTE (> 50MB), AVVIO IL CHUNKING ANTI-LIMITE
-  // ==========================================
-  if (input.size > CHUNK_SIZE) {
-    console.log(`[UPLOAD] 🚀 File oltre i 50MB rilevato! Avvio Upload Chunked senza limiti...`);
-    
-    // 1. Dico a R2 di prepararsi a ricevere un file in pezzi
-    const startRes = await fetch(`${WORKER_URL}/upload/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileName: finalFileName })
-    });
-    if(!startRes.ok) throw new Error("Avvio Multipart Fallito");
-    const { uploadId, key } = await startRes.json();
+  // Chiama il tuo nuovo Worker su Cloudflare
+  const uploadRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/upload", {
+    method: "POST",
+    body: formData
+  });
 
-    // 2. Invio il file 50MB alla volta 
-    const parts = [];
-    for (let start = 0, partNum = 1; start < input.size; start += CHUNK_SIZE, partNum++) {
-      const chunk = input.slice(start, start + CHUNK_SIZE);
-      console.log(`[UPLOAD] 📦 Invio pezzo ${partNum} di ${Math.ceil(input.size/CHUNK_SIZE)}...`);
-      
-      const partRes = await fetch(`${WORKER_URL}/upload/part?uploadId=${uploadId}&key=${key}&partNumber=${partNum}`, {
-        method: "POST",
-        body: chunk 
-      });
-      
-      if(!partRes.ok) throw new Error(`Errore durante l'upload del pezzo ${partNum}`);
-      const partData = await partRes.json();
-      parts.push(partData); // Salvo gli ETag generati da R2
-    }
-
-    // 3. Dico al Worker di "Cucire" tutti i pezzi assieme nel R2 Bucket
-    console.log(`[UPLOAD] 🧩 Tutti i pezzi caricati! Unione in corso su R2...`);
-    const compRes = await fetch(`${WORKER_URL}/upload/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ uploadId, key, parts })
-    });
-
-    if(!compRes.ok) throw new Error("Errore nell'unione finale del file gigante");
-    const compData = await compRes.json();
-    console.log(`[UPLOAD] ✅ Successo (Chunked)! URL finale pronto:`, compData.url);
-    return compData.url;
+  if (!uploadRes.ok) {
+    const errorText = await uploadRes.text();
+    console.error("Cloudflare upload error:", errorText);
+    throw new Error("Errore durante il caricamento dell'immagine su Cloudflare R2");
   }
 
-  // ==========================================
-  // SE IL FILE E' < 50MB, FACCIO UN UPLOAD STANDARD DRITTO
-  // ==========================================
-  const controller = new AbortController();
-  // Alzo comunque a 3 minuti per connessioni non velocissime
-  const timeoutId = setTimeout(() => controller.abort(), 180000); 
-
-  try {
-    const uploadRes = await fetch(`${WORKER_URL}/upload`, {
-      method: "POST",
-      headers: {
-        "Content-Type": input.type || "application/octet-stream",
-        "x-file-name": safeFileName
-      },
-      body: input,
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-
-    if (!uploadRes.ok) {
-      const errorText = await uploadRes.text();
-      console.error("[UPLOAD] ❌ Errore Standard R2:", uploadRes.status, errorText);
-      throw new Error(`Upload Fallito. Status ${uploadRes.status}: ${errorText}`);
-    }
-
-    const cloudflareData = await uploadRes.json();
-    console.log(`[UPLOAD] ✅ Successo (Standard)! URL generato:`, cloudflareData.url);
-    return cloudflareData.url; 
-  } catch (err: any) {
-    clearTimeout(timeoutId);
-    if (err.name === 'AbortError') throw new Error("Upload interrotto per rete debole.");
-    throw err;
-  }
+  const cloudflareData = await uploadRes.json();
+  return cloudflareData.url; // Questo è il tuo link pubblico .r2.dev!
 }
 
-// 🚀 FUNZIONE DIRETTA AL WORKER CON TIMEOUT E TRACCIAMENTO
-async function workerBulkCreate(payload: any) {
-  const url = "https://gelato-backend.andrea-bilotta00.workers.dev/gelato-bulk-create";
-  console.log(`[WORKER CHIAMATA] 📡 Invio payload a: ${url}`, payload);
-  
-  if (DEBUG_WEBHOOK_URL) {
-      try {
-          fetch(DEBUG_WEBHOOK_URL, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ type: "PRE_FLIGHT_GELATO", payload })
-          });
-          console.log("[WEBHOOK] 🌐 Payload inoltrato a webhook.site per ispezione");
-      } catch(e) {}
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 Minuti di limite
-
-  try {
-      const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-
-      const rawText = await response.text();
-      console.log(`[WORKER RISPOSTA] 📥 Status: ${response.status}`, rawText);
-
-      let data;
-      try { data = JSON.parse(rawText); } catch { data = { error: rawText }; }
-
-      if (!response.ok) {
-          throw new Error(data.error || `Errore HTTP ${response.status}`);
-      }
-      return data;
-
-  } catch(err: any) {
-      clearTimeout(timeoutId);
-      if (err.name === 'AbortError') {
-          console.error("[WORKER CHIAMATA] 🚨 TIMEOUT! Gelato o Cloudflare sono bloccati.");
-          throw new Error("Tempo scaduto! Il server ha impiegato più di 2 minuti per creare i prodotti.");
-      }
-      throw err;
-  }
-}
-
+// ---------- componente ----------
 export function BulkCreator() {
   const { toast } = useToast();
   const [currentStep, setCurrentStep] = useState(1);
@@ -337,6 +245,7 @@ export function BulkCreator() {
   const [createdProducts, setCreatedProducts] = useState<any[]>([]);
   const [template, setTemplate] = useState<any | null>(null);
 
+  // ---- bootstrap credenziali da localStorage ----
   useEffect(() => {
     try {
       const raw = localStorage.getItem("gelato.creds");
@@ -353,12 +262,15 @@ export function BulkCreator() {
     setCredentials(creds);
     setIsConnected(true);
     setCurrentStep(2);
-    try { localStorage.setItem("gelato.creds", JSON.stringify(creds)); } catch {}
-    toast({ title: "Connected Successfully!", description: `Connected to ${creds.storeName}` });
+    try {
+      localStorage.setItem("gelato.creds", JSON.stringify(creds));
+    } catch {}
+    toast({ title: "Connected Successfully!", description: `Connected to ${creds.storeName} via Gelato API` });
   };
 
   const handleImagesChange = (newImages: ImageFile[]) => {
     setImages(newImages);
+    // avanza almeno allo step 3
     setCurrentStep((prev) => (newImages.length > 0 ? Math.max(prev, 3) : prev));
   };
 
@@ -371,16 +283,15 @@ export function BulkCreator() {
     toast({ title: "Rules Saved", description: "Product creation rules have been saved successfully" });
   };
 
-  // 🚀 LOGICA COMPLETA CON ANTI-CRASH E ANTI-HANG
   const handleCreateProducts = async () => {
-    console.log("=========================================");
-    console.log("🏁 [MAIN PROCESS] AVVIO CREAZIONE PRODOTTI");
-    console.log("=========================================");
-    
     if (!images.length || !selectedProduct) return;
 
     if (!isUuid(selectedProduct.id)) {
-      toast({ title: "Invalid template", description: "Carica un VERO Template ID Gelato (UUID)", variant: "destructive" });
+      toast({
+        title: "Invalid template",
+        description: "In Step 3 carica un vero Template ID Gelato (UUID) e premi “Load Template”.",
+        variant: "destructive",
+      });
       return;
     }
 
@@ -388,132 +299,157 @@ export function BulkCreator() {
     setCreationProgress(0);
 
     try {
-      const chosenTemplateId = selectedProduct.id;
-      console.log(`[MAIN PROCESS] Recupero template: ${chosenTemplateId}...`);
+      const FALLBACK_TEMPLATE_ID = import.meta.env.VITE_GELATO_TEMPLATE_ID as string | undefined;
+      const chosenTemplateId = (isUuid(selectedProduct.id) ? selectedProduct.id : undefined) || FALLBACK_TEMPLATE_ID;
+
+      if (!chosenTemplateId) {
+        setIsCreating(false);
+        toast({
+          title: "Template ID mancante",
+          description: "Inserisci un Template ID Gelato (UUID) oppure configura VITE_GELATO_TEMPLATE_ID.",
+          variant: "destructive",
+        });
+        return;
+      }
+
       const tpl = await getTemplate(chosenTemplateId);
       setTemplate(tpl);
 
       const tplVariants: any[] = tpl?.variants ?? [];
       if (!tplVariants.length) {
-         throw new Error("Nessuna variante trovata per questo Template ID.");
+        toast({ title: "Template error", description: "Nessuna variante trovata nel template.", variant: "destructive" });
+        setIsCreating(false);
+        return;
       }
 
-      console.log(`[MAIN PROCESS] Template recuperato. Varianti totali: ${tplVariants.length}. Immagini da caricare: ${images.length}`);
+      // Prepara prodotti: per OGNI immagine, genera tutte le varianti del template
+      const products = await Promise.all(
+        images.map(async (image, index) => {
+          // 1) Titolo
+          let title: string;
+          if (rules.titleMode === "filename") {
+            title = image.name.replace(/\.[^/.]+$/, "");
+          } else if (rules.titleMode === "ai-simple") {
+            title = `AI Generated Title ${index + 1}`;
+          } else {
+            title = `Custom Product ${index + 1}`;
+          }
+          if (rules.includeCustomTitle && rules.titleCustomText) {
+            title += ` ${rules.titleCustomText}`;
+          }
 
-      const products = [];
-      const totalSteps = images.length * tplVariants.length;
+          // 2) Per ogni variante calcolo dimensioni target e preparo l'upload
+          const variantsPayload = await Promise.all(
+            tplVariants.map(async (v: any) => {
+              const placeholderName =
+                v?.imagePlaceholders?.[0]?.name ||
+                tpl?.imagePlaceholders?.[0]?.name ||
+                "front";
 
-      for (let imgIndex = 0; imgIndex < images.length; imgIndex++) {
-        const image = images[imgIndex];
-        console.log(`\n▶️ [ELABORAZIONE] Immagine ${imgIndex + 1}/${images.length}: ${image.name}`);
+              const inches = parseVariantInches(v?.title) || [12, 16]; // fallback
+              const DPI = processingOptions.upscale ? 300 : 150;
+              const targetW = Math.round(inches[0] * DPI);
+              const targetH = Math.round(inches[1] * DPI);
 
-        let title: string;
-        if (rules.titleMode === "filename") title = image.name.replace(/\.[^/.]+$/, "");
-        else if (rules.titleMode === "ai-simple") title = `AI Generated Title ${imgIndex + 1}`;
-        else title = `Custom Product ${imgIndex + 1}`;
-        
-        if (rules.includeCustomTitle && rules.titleCustomText) title += ` ${rules.titleCustomText}`;
+              // Deve esistere anche fuori dall'if
+              let fileToUpload: File = image.file;
 
-        const variantsPayload = [];
-        let singleUploadUrl = null;
-        
-        if (processingOptions.fitMode === "exact") {
-            const safeName = (image.file.name || image.name).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9.-]/g, "");
-            const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
-            console.log(`[MAIN PROCESS] Modalità EXACT. Faccio un solo upload per tutte le varianti.`);
-            singleUploadUrl = await uploadAndGetPublicUrl(image.file, destPath);
-        }
+              // "stretch" = distorsione piena, "preserve" = contain + centering, "exact" = usa originale
+              const transformed = await transformForVariant(
+                image.file,
+                targetW,
+                targetH,
+                processingOptions.fitMode,   // "stretch" | "preserve" | "exact"
+                processingOptions.upscale
+              );
 
-        for (let vIndex = 0; vIndex < tplVariants.length; vIndex++) {
-            const v = tplVariants[vIndex];
-            
-            const currentStepNum = (imgIndex * tplVariants.length) + vIndex;
-            setCreationProgress((currentStepNum / totalSteps) * 80);
+              if (transformed) {
+                const baseType = image.file.type || "image/png";
+                const ext =
+                  baseType.includes("png") ? "png" :
+                  baseType.includes("webp") ? "webp" :
+                  (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
 
-            const placeholderName = v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "default";
-            let finalUrl = singleUploadUrl;
+                const fname = image.name.replace(/\.[^/.]+$/, "");
+                fileToUpload = new File(
+                  [transformed],
+                  `${fname}-${targetW}x${targetH}.${ext}`,
+                  { type: baseType }
+                );
+              }
 
-            if (!finalUrl) {
-                const inches = parseVariantInches(v?.title) || [12, 16]; 
-                const DPI = processingOptions.upscale ? 300 : 150;
-                const targetW = Math.round(inches[0] * DPI);
-                const targetH = Math.round(inches[1] * DPI);
+              const safeName = (fileToUpload.name || image.name)
+                .toLowerCase()
+                .replace(/\s+/g, "-")
+                .replace(/[^a-z0-9.-]/g, "");
 
-                console.log(`[ELABORAZIONE] Trasformazione file per variante ${v.id} (${targetW}x${targetH} px)`);
-                const transformed = await transformForVariant(image.file, targetW, targetH, processingOptions.fitMode, processingOptions.upscale);
+              const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+              const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
 
-                let fileToUpload: File = image.file;
-                if (transformed) {
-                  const baseType = image.file.type || "image/png";
-                  const ext = baseType.includes("png") ? "png" : baseType.includes("webp") ? "webp" : "jpg";
-                  const fname = image.name.replace(/\.[^/.]+$/, "");
-                  fileToUpload = new File([transformed], `${fname}-${targetW}x${targetH}.${ext}`, { type: baseType });
-                }
+              return {
+                templateVariantId: v.id,
+                imagePlaceholders: [
+                  {
+                    name: placeholderName,
+                    fileUrl: publicUrl,
+                  },
+                ],
+              };
+            })
+          );
 
-                const safeName = (fileToUpload.name || image.name).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9.-]/g, "");
-                const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
-                finalUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
-            }
+          return {
+            title,
+            description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
+            tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
+            variants: variantsPayload, // <— tutte le varianti del template
+          };
+        })
+      );
 
-            variantsPayload.push({
-              templateVariantId: v.id,
-              imagePlaceholders: [{ name: placeholderName, fileUrl: finalUrl }]
-            });
-        }
-
-        products.push({
-          title,
-          description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
-          tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
-          variants: variantsPayload,
-        });
-      }
-
-      setCreationProgress(90); 
-      console.log("\n📦 [MAIN PROCESS] Tutti gli upload completati! Invio dati definitivi al backend...");
-
-      // CHIAMIAMO DIRETTAMENTE IL WORKER CON TRACCIAMENTO
-      const data = await workerBulkCreate({
+      // invio alla edge
+      const data = await bulkCreate({
         templateId: tpl.id,
         publish: true,
         products,
         storeId: STORE_ID,
-        salesChannels: ["shopify"], // <-- Messo Shopify di Default
+        salesChannels: ["shopify"],
       });
-
-      console.log("✅ [MAIN PROCESS] Processo terminato con successo. Risultati:", data);
 
       const results = data.results || [];
       setCreatedProducts(results);
       setCreationProgress(100);
       setIsCreating(false);
 
-      const successCount = results.filter((r: any) => r.status === "active" || r.status === "created_in_background").length;
+      const successCount = results.filter((r: any) => r.status === "active").length;
       const errorCount = results.filter((r: any) => r.status === "error").length;
 
       if (successCount > 0) {
         toast({
-          title: "🎉 Prodotti Creati!",
-          description: `Creati ${successCount} prodotti. ${errorCount ? `${errorCount} falliti.` : ""}`,
+          title: "🎉 Products Created",
+          description: `Created ${successCount} products in your Gelato store. ${errorCount ? `${errorCount} failed.` : ""}`,
         });
       } else {
-        toast({ title: "Creazione Fallita", description: "Controlla la console (F12) per i dettagli dell'errore.", variant: "destructive" });
+        toast({
+          title: "Product Creation Failed",
+          description: "Failed to create products. Check console for details.",
+          variant: "destructive",
+        });
       }
-
     } catch (error: any) {
-      console.error("❌❌ [FATAL ERROR] Errore critico catturato e fermato:", error);
+      console.error("Error creating products:", error);
       setIsCreating(false);
       setCreationProgress(0);
-      toast({ 
-        title: "Errore di Sistema", 
-        description: error?.message ?? "Fallimento sconosciuto durante la creazione", 
-        variant: "destructive" 
+      toast({
+        title: "Error creating products",
+        description: error?.message ?? "Failed to create products",
+        variant: "destructive",
       });
     }
   };
 
   const completedSteps = [isConnected, images.length > 0, !!selectedProduct, createdProducts.length > 0].filter(Boolean).length;
-  const successCount = createdProducts.filter((r: any) => r.status === "active" || r.status === "created_in_background").length;
+  const successCount = createdProducts.filter((r: any) => r.status === "active").length;
   const hasSuccess = successCount > 0;
 
   return (
@@ -531,19 +467,57 @@ export function BulkCreator() {
         </CardContent>
       </Card>
 
-      <StepCard step={1} title="Connect Your Gelato Store" description="Enter your API credentials to enable product creation" isActive={currentStep === 1} isCompleted={isConnected}>
-        {(!isConnected || currentStep === 1) && <ApiConnection onConnect={handleConnect} isConnected={isConnected} />}
+      {/* Step 1 */}
+      <StepCard
+        step={1}
+        title="Connect Your Gelato Store"
+        description="Enter your API credentials to enable product creation"
+        isActive={currentStep === 1}
+        isCompleted={isConnected}
+      >
+        {(!isConnected || currentStep === 1) && (
+          <ApiConnection onConnect={handleConnect} isConnected={isConnected} />
+        )}
       </StepCard>
 
-      <StepCard step={2} title="Upload Your Design Files" description="Select images and configure processing options" isActive={currentStep === 2} isCompleted={images.length > 0}>
-        {(currentStep === 2 || images.length > 0) && isConnected && <ImageUploader onImagesChange={handleImagesChange} processingOptions={processingOptions} onOptionsChange={setProcessingOptions} />}
+      {/* Step 2 */}
+      <StepCard
+        step={2}
+        title="Upload Your Design Files"
+        description="Select images and configure processing options"
+        isActive={currentStep === 2}
+        isCompleted={images.length > 0}
+      >
+        {(currentStep === 2 || images.length > 0) && isConnected && (
+          <ImageUploader
+            onImagesChange={handleImagesChange}
+            processingOptions={processingOptions}
+            onOptionsChange={setProcessingOptions}
+          />
+        )}
       </StepCard>
 
-      <StepCard step={3} title="Choose Example Product" description="Select a product from your catalog to use as a template" isActive={currentStep === 3} isCompleted={!!selectedProduct}>
-        {(currentStep === 3 || selectedProduct) && images.length > 0 && <ProductSelector onProductSelect={handleProductSelect} selectedProduct={selectedProduct} />}
+      {/* Step 3 */}
+      <StepCard
+        step={3}
+        title="Choose Example Product"
+        description="Select a product from your catalog to use as a template"
+        isActive={currentStep === 3}
+        isCompleted={!!selectedProduct}
+      >
+        {(currentStep === 3 || selectedProduct) && images.length > 0 && (
+          <ProductSelector onProductSelect={handleProductSelect} selectedProduct={selectedProduct} />
+        )}
       </StepCard>
 
-      <StepCard step={4} title="Product Creation Rules" description="Set up titles, descriptions, and tags for bulk creation" isActive={currentStep === 4} isCompleted={createdProducts.length > 0}>
+      {/* Step 4 */}
+      <StepCard
+        step={4}
+        title="Product Creation Rules"
+        description="Set up titles, descriptions, and tags for bulk creation"
+        isActive={currentStep === 4}
+        isCompleted={createdProducts.length > 0}
+      >
         {currentStep === 4 && selectedProduct && (
           <div className="space-y-6">
             <ProductRules rules={rules} onRulesChange={setRules} onSave={handleSaveRules} />
@@ -556,16 +530,27 @@ export function BulkCreator() {
                 </div>
 
                 <div className="grid grid-cols-3 gap-4 text-sm text-muted-foreground mb-6">
-                  <div><div className="font-medium text-foreground">{images.length}</div><div>Images Ready</div></div>
-                  <div><div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div><div>Product Variants</div></div>
-                  <div><div className="font-medium text-foreground">{images.length * ((template?.variants || []).length || 0)}</div><div>Total Uploads</div></div>
+                  <div>
+                    <div className="font-medium text-foreground">{images.length}</div>
+                    <div>Images Ready</div>
+                  </div>
+                  <div>
+                    <div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div>
+                    <div>Product Variants</div>
+                  </div>
+                  <div>
+                    <div className="font-medium text-foreground">
+                      {images.length * ((template?.variants || []).length || 0)}
+                    </div>
+                    <div>Total Products</div>
+                  </div>
                 </div>
 
                 {isCreating ? (
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Processing and Uploading... Controlla la Console (F12)</span>
+                      <span>Creating products...</span>
                     </div>
                     <Progress value={creationProgress} />
                     <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% complete</p>
@@ -576,10 +561,17 @@ export function BulkCreator() {
                       <CheckCircle className="h-5 w-5" />
                       <span className="font-medium">Products Created Successfully!</span>
                     </div>
+                    <div className="text-sm text-muted-foreground">Created {successCount} products in your Gelato store</div>
                   </div>
                 ) : (
-                  <Button onClick={handleCreateProducts} disabled={!images.length || !selectedProduct} size="lg" className="bg-gradient-to-r from-success to-success/80 text-white">
-                    <Rocket className="h-4 w-4 mr-2" /> Create {images.length} Products
+                  <Button
+                    onClick={handleCreateProducts}
+                    disabled={!images.length || !selectedProduct}
+                    size="lg"
+                    className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
+                  >
+                    <Rocket className="h-4 w-4 mr-2" />
+                    Create {images.length} Products
                   </Button>
                 )}
               </CardContent>
