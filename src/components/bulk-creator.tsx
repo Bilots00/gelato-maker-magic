@@ -178,17 +178,69 @@ async function transformForVariant(
   });
 }
 
-// 🚀 UPLOAD OTTIMIZZATO CON TIMEOUT ANTI-FREEZE
+// 🚀 UPLOAD OTTIMIZZATO SENZA ALCUN LIMITE DI DIMENSIONE (VIA CHUNKS R2)
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const safeFileName = destPath.split('/').pop() || "image.jpg";
-  console.log(`[UPLOAD] 📤 Inizio invio file: ${safeFileName} | Dimensione: ${(input.size / (1024*1024)).toFixed(2)} MB`);
+  const safeFileName = destPath.split('/').pop() || `image-${Date.now()}.jpg`;
+  const finalFileName = `uploads/${Date.now()}-${safeFileName}`;
+  console.log(`[UPLOAD] 📤 Inizio invio file: ${finalFileName} | Dimensione: ${(input.size / (1024*1024)).toFixed(2)} MB`);
   
-  // Timeout forzato di 2 Minuti (120.000 ms)
+  const CHUNK_SIZE = 50 * 1024 * 1024; // Affetta a pacchetti da 50MB
+  const WORKER_URL = "https://gelato-backend.andrea-bilotta00.workers.dev"; // Assicurati che l'URL sia corretto
+
+  // ==========================================
+  // SE IL FILE E' GIGANTE (> 50MB), AVVIO IL CHUNKING ANTI-LIMITE
+  // ==========================================
+  if (input.size > CHUNK_SIZE) {
+    console.log(`[UPLOAD] 🚀 File oltre i 50MB rilevato! Avvio Upload Chunked senza limiti...`);
+    
+    // 1. Dico a R2 di prepararsi a ricevere un file in pezzi
+    const startRes = await fetch(`${WORKER_URL}/upload/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileName: finalFileName })
+    });
+    if(!startRes.ok) throw new Error("Avvio Multipart Fallito");
+    const { uploadId, key } = await startRes.json();
+
+    // 2. Invio il file 50MB alla volta 
+    const parts = [];
+    for (let start = 0, partNum = 1; start < input.size; start += CHUNK_SIZE, partNum++) {
+      const chunk = input.slice(start, start + CHUNK_SIZE);
+      console.log(`[UPLOAD] 📦 Invio pezzo ${partNum} di ${Math.ceil(input.size/CHUNK_SIZE)}...`);
+      
+      const partRes = await fetch(`${WORKER_URL}/upload/part?uploadId=${uploadId}&key=${key}&partNumber=${partNum}`, {
+        method: "POST",
+        body: chunk 
+      });
+      
+      if(!partRes.ok) throw new Error(`Errore durante l'upload del pezzo ${partNum}`);
+      const partData = await partRes.json();
+      parts.push(partData); // Salvo gli ETag generati da R2
+    }
+
+    // 3. Dico al Worker di "Cucire" tutti i pezzi assieme nel R2 Bucket
+    console.log(`[UPLOAD] 🧩 Tutti i pezzi caricati! Unione in corso su R2...`);
+    const compRes = await fetch(`${WORKER_URL}/upload/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uploadId, key, parts })
+    });
+
+    if(!compRes.ok) throw new Error("Errore nell'unione finale del file gigante");
+    const compData = await compRes.json();
+    console.log(`[UPLOAD] ✅ Successo (Chunked)! URL finale pronto:`, compData.url);
+    return compData.url;
+  }
+
+  // ==========================================
+  // SE IL FILE E' < 50MB, FACCIO UN UPLOAD STANDARD DRITTO
+  // ==========================================
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 120000);
+  // Alzo comunque a 3 minuti per connessioni non velocissime
+  const timeoutId = setTimeout(() => controller.abort(), 180000); 
 
   try {
-    const uploadRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/upload", {
+    const uploadRes = await fetch(`${WORKER_URL}/upload`, {
       method: "POST",
       headers: {
         "Content-Type": input.type || "application/octet-stream",
@@ -198,24 +250,20 @@ async function uploadAndGetPublicUrl(input: File, destPath: string) {
       signal: controller.signal
     });
     
-    clearTimeout(timeoutId); // Cancelliamo il timeout se ha successo
+    clearTimeout(timeoutId);
 
     if (!uploadRes.ok) {
       const errorText = await uploadRes.text();
-      console.error("[UPLOAD] ❌ Errore Cloudflare R2:", uploadRes.status, errorText);
+      console.error("[UPLOAD] ❌ Errore Standard R2:", uploadRes.status, errorText);
       throw new Error(`Upload Fallito. Status ${uploadRes.status}: ${errorText}`);
     }
 
     const cloudflareData = await uploadRes.json();
-    console.log(`[UPLOAD] ✅ Successo! URL generato:`, cloudflareData.url);
+    console.log(`[UPLOAD] ✅ Successo (Standard)! URL generato:`, cloudflareData.url);
     return cloudflareData.url; 
   } catch (err: any) {
     clearTimeout(timeoutId);
-    if (err.name === 'AbortError') {
-      console.error("[UPLOAD] 🚨 TIMEOUT RAGGIUNTO! File bloccato in rete.");
-      throw new Error("L'upload ci sta mettendo troppo tempo (> 2 Minuti). Cloudflare o la connessione potrebbero aver droppato il file gigante.");
-    }
-    console.error("[UPLOAD] ❌ Eccezione fatale:", err);
+    if (err.name === 'AbortError') throw new Error("Upload interrotto per rete debole.");
     throw err;
   }
 }
