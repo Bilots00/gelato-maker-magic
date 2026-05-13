@@ -46,14 +46,14 @@ type ProductRulesType = {
 };
 
 const defaultRules: ProductRulesType = {
-  titleMode: "ai-simple",
+  titleMode: "filename", // <-- CAMBIATO DA "ai-simple"
   titleMaxWords: 8,
   titleCustomText: "",
-  descriptionMode: "ai",
+  descriptionMode: "copy", // <-- CAMBIATO DA "ai"
   descriptionParagraphs: 2,
   descriptionSentences: 3,
   descriptionCustomHTML: "",
-  tagsMode: "ai",
+  tagsMode: "copy", // <-- CAMBIATO DA "ai"
   tagsMaxCount: 10,
   tagsCustom: [],
   includeCustomTitle: false,
