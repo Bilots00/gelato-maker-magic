@@ -63,12 +63,10 @@ const defaultRules: ProductRulesType = {
 const isUuid = (s?: string) =>
   !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
-// --- helpers: parse variant title -> inches ---
 const INCH_PER_CM = 1 / 2.54;
 
 function parseVariantInches(title?: string): [number, number] | null {
   if (!title) return null;
-  // es: "12x16 in - 30x40 cm"
   const mIn = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*in/i);
   if (mIn) return [parseFloat(mIn[1]), parseFloat(mIn[2])];
 
@@ -85,13 +83,11 @@ function extFromType(t: string) {
   return t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg";
 }
 
-// Loader più robusto + revoke dell'URL per evitare leak
 async function fileToImage(file: File): Promise<HTMLImageElement> {
   const url = URL.createObjectURL(file);
   try {
     const img = new Image();
     img.src = url;
-    // decode() non è sempre supportato in tutti i formati, fallback a onload
     if ("decode" in img) {
       await (img as any).decode().catch(
         () =>
@@ -108,20 +104,10 @@ async function fileToImage(file: File): Promise<HTMLImageElement> {
     }
     return img;
   } finally {
-    // non revochiamo subito: Chrome a volte usa il blob ancora durante drawImage
-    // verrà garbage-collectato da solo; niente revoke immediato qui.
+    // Il browser svuoterà la memoria da solo
   }
 }
 
-/**
- * stretch  -> riempi TUTTO distorcendo (NO crop, NO bordi)
- * preserve -> contain + center (mantieni ratio, possibili bordi)
- * exact    -> nessuna trasformazione
- *
- * Protezioni anti "EncodingError":
- * - limite dimensione massima canvas (larghezza/altezza/pixel totali)
- * - scala sicura anche quando upscale=true
- */
 async function transformForVariant(
   file: File,
   targetW: number,
@@ -135,22 +121,13 @@ async function transformForVariant(
   const type = file.type || "image/png";
   const ext = extFromType(type);
 
-  // Limiti "safe" per Canvas (puoi alzarli se la tua macchina regge)
-  const MAX_W = 8192;                 // lim. per lato
+  const MAX_W = 8192;
   const MAX_H = 8192;
-  const MAX_PIXELS = 48_000_000;      // ~48 MP
+  const MAX_PIXELS = 48_000_000;
 
-  // Scala base: mantieni sempre il ratio della PRINT AREA (targetW:targetH).
-  // Se non fai upscale, riduci in base all'immagine sorgente.
-  const scaleBySource = Math.min(
-    img.naturalWidth / targetW,
-    img.naturalHeight / targetH
-  );
-
-  // Con upscale=true posso arrivare a 1, con upscale=false non supero la sorgente
+  const scaleBySource = Math.min(img.naturalWidth / targetW, img.naturalHeight / targetH);
   let scale = upscale ? 1 : Math.min(1, scaleBySource);
 
-  // Applica cap per non superare i limiti del canvas
   const capBySide = Math.min(MAX_W / targetW, MAX_H / targetH, 1);
   const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (targetW * targetH)));
   const safeCap = Math.min(capBySide, capByPixels);
@@ -166,10 +143,8 @@ async function transformForVariant(
   ctx.clearRect(0, 0, canvasW, canvasH);
 
   if (fitMode === "stretch") {
-    // === STRETCH: distorsione piena per riempire, NES-SUN CROP ===
     ctx.drawImage(img, 0, 0, canvasW, canvasH);
   } else {
-    // === PRESERVE: contain + center ===
     const srcR = img.naturalWidth / img.naturalHeight;
     const dstR = canvasW / canvasH;
     let drawW: number, drawH: number;
@@ -187,15 +162,11 @@ async function transformForVariant(
 
   const quality = /jpe?g/i.test(type) ? 0.92 : 1;
 
-  // toBlob può comunque fallire: catturiamo e segnaliamo
   return await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
       (b) => {
-        if (!b) {
-          reject(new DOMException("Canvas encoding failed", "EncodingError"));
-        } else {
-          resolve(b);
-        }
+        if (!b) reject(new DOMException("Canvas encoding failed", "EncodingError"));
+        else resolve(b);
       },
       type.includes("image/") ? type : `image/${ext}`,
       quality
@@ -203,15 +174,17 @@ async function transformForVariant(
   });
 }
 
+// 🚀 UPLOAD OTTIMIZZATO SENZA FORMDATA PER FILE GIGANTI
 async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const formData = new FormData();
-  // Passiamo anche il destPath come nome file per mantenere la logica invariata
-  formData.append("file", input, destPath.split('/').pop());
-
-  // Chiama il tuo nuovo Worker su Cloudflare
+  const safeFileName = destPath.split('/').pop() || "image.jpg";
+  
   const uploadRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/upload", {
     method: "POST",
-    body: formData
+    headers: {
+      "Content-Type": input.type || "application/octet-stream",
+      "x-file-name": safeFileName
+    },
+    body: input // <- Mandiamo il file nudo e crudo! Zero memory leak!
   });
 
   if (!uploadRes.ok) {
@@ -221,10 +194,9 @@ async function uploadAndGetPublicUrl(input: File, destPath: string) {
   }
 
   const cloudflareData = await uploadRes.json();
-  return cloudflareData.url; // Questo è il tuo link pubblico .r2.dev!
+  return cloudflareData.url; 
 }
 
-// ---------- componente ----------
 export function BulkCreator() {
   const { toast } = useToast();
   const [currentStep, setCurrentStep] = useState(1);
@@ -245,7 +217,6 @@ export function BulkCreator() {
   const [createdProducts, setCreatedProducts] = useState<any[]>([]);
   const [template, setTemplate] = useState<any | null>(null);
 
-  // ---- bootstrap credenziali da localStorage ----
   useEffect(() => {
     try {
       const raw = localStorage.getItem("gelato.creds");
@@ -262,15 +233,12 @@ export function BulkCreator() {
     setCredentials(creds);
     setIsConnected(true);
     setCurrentStep(2);
-    try {
-      localStorage.setItem("gelato.creds", JSON.stringify(creds));
-    } catch {}
-    toast({ title: "Connected Successfully!", description: `Connected to ${creds.storeName} via Gelato API` });
+    try { localStorage.setItem("gelato.creds", JSON.stringify(creds)); } catch {}
+    toast({ title: "Connected Successfully!", description: `Connected to ${creds.storeName}` });
   };
 
   const handleImagesChange = (newImages: ImageFile[]) => {
     setImages(newImages);
-    // avanza almeno allo step 3
     setCurrentStep((prev) => (newImages.length > 0 ? Math.max(prev, 3) : prev));
   };
 
@@ -283,15 +251,12 @@ export function BulkCreator() {
     toast({ title: "Rules Saved", description: "Product creation rules have been saved successfully" });
   };
 
+  // 🚀 LOGICA SEQUENZIALE ANTI-CRASH
   const handleCreateProducts = async () => {
     if (!images.length || !selectedProduct) return;
 
     if (!isUuid(selectedProduct.id)) {
-      toast({
-        title: "Invalid template",
-        description: "In Step 3 carica un vero Template ID Gelato (UUID) e premi “Load Template”.",
-        variant: "destructive",
-      });
+      toast({ title: "Invalid template", description: "Carica un VERO Template ID Gelato (UUID)", variant: "destructive" });
       return;
     }
 
@@ -299,115 +264,91 @@ export function BulkCreator() {
     setCreationProgress(0);
 
     try {
-      const FALLBACK_TEMPLATE_ID = import.meta.env.VITE_GELATO_TEMPLATE_ID as string | undefined;
-      const chosenTemplateId = (isUuid(selectedProduct.id) ? selectedProduct.id : undefined) || FALLBACK_TEMPLATE_ID;
-
-      if (!chosenTemplateId) {
-        setIsCreating(false);
-        toast({
-          title: "Template ID mancante",
-          description: "Inserisci un Template ID Gelato (UUID) oppure configura VITE_GELATO_TEMPLATE_ID.",
-          variant: "destructive",
-        });
-        return;
-      }
-
+      const chosenTemplateId = selectedProduct.id;
       const tpl = await getTemplate(chosenTemplateId);
       setTemplate(tpl);
 
       const tplVariants: any[] = tpl?.variants ?? [];
       if (!tplVariants.length) {
-        toast({ title: "Template error", description: "Nessuna variante trovata nel template.", variant: "destructive" });
+        toast({ title: "Template error", description: "Nessuna variante trovata.", variant: "destructive" });
         setIsCreating(false);
         return;
       }
 
-      // Prepara prodotti: per OGNI immagine, genera tutte le varianti del template
-      const products = await Promise.all(
-        images.map(async (image, index) => {
-          // 1) Titolo
-          let title: string;
-          if (rules.titleMode === "filename") {
-            title = image.name.replace(/\.[^/.]+$/, "");
-          } else if (rules.titleMode === "ai-simple") {
-            title = `AI Generated Title ${index + 1}`;
-          } else {
-            title = `Custom Product ${index + 1}`;
-          }
-          if (rules.includeCustomTitle && rules.titleCustomText) {
-            title += ` ${rules.titleCustomText}`;
-          }
+      const products = [];
+      const totalSteps = images.length * tplVariants.length;
 
-          // 2) Per ogni variante calcolo dimensioni target e preparo l'upload
-          const variantsPayload = await Promise.all(
-            tplVariants.map(async (v: any) => {
-              const placeholderName =
-                v?.imagePlaceholders?.[0]?.name ||
-                tpl?.imagePlaceholders?.[0]?.name ||
-                "front";
+      // CICLO FOR: Processiamo le immagini UNA alla volta
+      for (let imgIndex = 0; imgIndex < images.length; imgIndex++) {
+        const image = images[imgIndex];
 
-              const inches = parseVariantInches(v?.title) || [12, 16]; // fallback
-              const DPI = processingOptions.upscale ? 300 : 150;
-              const targetW = Math.round(inches[0] * DPI);
-              const targetH = Math.round(inches[1] * DPI);
+        let title: string;
+        if (rules.titleMode === "filename") title = image.name.replace(/\.[^/.]+$/, "");
+        else if (rules.titleMode === "ai-simple") title = `AI Generated Title ${imgIndex + 1}`;
+        else title = `Custom Product ${imgIndex + 1}`;
+        
+        if (rules.includeCustomTitle && rules.titleCustomText) title += ` ${rules.titleCustomText}`;
 
-              // Deve esistere anche fuori dall'if
-              let fileToUpload: File = image.file;
+        const variantsPayload = [];
+        
+        // Magia Nera: Se l'utente vuole "exact match", carichiamo l'immagine UNA volta e la usiamo per tutto!
+        let singleUploadUrl = null;
+        if (processingOptions.fitMode === "exact") {
+            const safeName = (image.file.name || image.name).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9.-]/g, "");
+            const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+            singleUploadUrl = await uploadAndGetPublicUrl(image.file, destPath);
+        }
 
-              // "stretch" = distorsione piena, "preserve" = contain + centering, "exact" = usa originale
-              const transformed = await transformForVariant(
-                image.file,
-                targetW,
-                targetH,
-                processingOptions.fitMode,   // "stretch" | "preserve" | "exact"
-                processingOptions.upscale
-              );
+        // CICLO FOR: Processiamo le varianti UNA alla volta
+        for (let vIndex = 0; vIndex < tplVariants.length; vIndex++) {
+            const v = tplVariants[vIndex];
+            
+            const currentStepNum = (imgIndex * tplVariants.length) + vIndex;
+            setCreationProgress((currentStepNum / totalSteps) * 80); // L'80% del tempo è upload
 
-              if (transformed) {
-                const baseType = image.file.type || "image/png";
-                const ext =
-                  baseType.includes("png") ? "png" :
-                  baseType.includes("webp") ? "webp" :
-                  (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
+            const placeholderName = v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "default";
+            let finalUrl = singleUploadUrl;
 
-                const fname = image.name.replace(/\.[^/.]+$/, "");
-                fileToUpload = new File(
-                  [transformed],
-                  `${fname}-${targetW}x${targetH}.${ext}`,
-                  { type: baseType }
+            // Se non è "exact", elaboriamo e carichiamo il file specifico per la variante
+            if (!finalUrl) {
+                const inches = parseVariantInches(v?.title) || [12, 16]; 
+                const DPI = processingOptions.upscale ? 300 : 150;
+                const targetW = Math.round(inches[0] * DPI);
+                const targetH = Math.round(inches[1] * DPI);
+
+                const transformed = await transformForVariant(
+                  image.file, targetW, targetH, processingOptions.fitMode, processingOptions.upscale
                 );
-              }
 
-              const safeName = (fileToUpload.name || image.name)
-                .toLowerCase()
-                .replace(/\s+/g, "-")
-                .replace(/[^a-z0-9.-]/g, "");
+                let fileToUpload: File = image.file;
+                if (transformed) {
+                  const baseType = image.file.type || "image/png";
+                  const ext = baseType.includes("png") ? "png" : baseType.includes("webp") ? "webp" : "jpg";
+                  const fname = image.name.replace(/\.[^/.]+$/, "");
+                  fileToUpload = new File([transformed], `${fname}-${targetW}x${targetH}.${ext}`, { type: baseType });
+                }
 
-              const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
-              const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+                const safeName = (fileToUpload.name || image.name).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9.-]/g, "");
+                const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+                finalUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+            }
 
-              return {
-                templateVariantId: v.id,
-                imagePlaceholders: [
-                  {
-                    name: placeholderName,
-                    fileUrl: publicUrl,
-                  },
-                ],
-              };
-            })
-          );
+            variantsPayload.push({
+              templateVariantId: v.id,
+              imagePlaceholders: [{ name: placeholderName, fileUrl: finalUrl }]
+            });
+        }
 
-          return {
-            title,
-            description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
-            tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
-            variants: variantsPayload, // <— tutte le varianti del template
-          };
-        })
-      );
+        products.push({
+          title,
+          description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
+          tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
+          variants: variantsPayload,
+        });
+      }
 
-      // invio alla edge
+      setCreationProgress(90); // Invio dati al worker
+
       const data = await bulkCreate({
         templateId: tpl.id,
         publish: true,
@@ -421,35 +362,27 @@ export function BulkCreator() {
       setCreationProgress(100);
       setIsCreating(false);
 
-      const successCount = results.filter((r: any) => r.status === "active").length;
+      const successCount = results.filter((r: any) => r.status === "active" || r.status === "created_in_background").length;
       const errorCount = results.filter((r: any) => r.status === "error").length;
 
       if (successCount > 0) {
         toast({
           title: "🎉 Products Created",
-          description: `Created ${successCount} products in your Gelato store. ${errorCount ? `${errorCount} failed.` : ""}`,
+          description: `Created ${successCount} products. ${errorCount ? `${errorCount} failed.` : ""}`,
         });
       } else {
-        toast({
-          title: "Product Creation Failed",
-          description: "Failed to create products. Check console for details.",
-          variant: "destructive",
-        });
+        toast({ title: "Creation Failed", description: "Check console for details.", variant: "destructive" });
       }
     } catch (error: any) {
       console.error("Error creating products:", error);
       setIsCreating(false);
       setCreationProgress(0);
-      toast({
-        title: "Error creating products",
-        description: error?.message ?? "Failed to create products",
-        variant: "destructive",
-      });
+      toast({ title: "Error", description: error?.message ?? "Failed to create products", variant: "destructive" });
     }
   };
 
   const completedSteps = [isConnected, images.length > 0, !!selectedProduct, createdProducts.length > 0].filter(Boolean).length;
-  const successCount = createdProducts.filter((r: any) => r.status === "active").length;
+  const successCount = createdProducts.filter((r: any) => r.status === "active" || r.status === "created_in_background").length;
   const hasSuccess = successCount > 0;
 
   return (
@@ -467,57 +400,19 @@ export function BulkCreator() {
         </CardContent>
       </Card>
 
-      {/* Step 1 */}
-      <StepCard
-        step={1}
-        title="Connect Your Gelato Store"
-        description="Enter your API credentials to enable product creation"
-        isActive={currentStep === 1}
-        isCompleted={isConnected}
-      >
-        {(!isConnected || currentStep === 1) && (
-          <ApiConnection onConnect={handleConnect} isConnected={isConnected} />
-        )}
+      <StepCard step={1} title="Connect Your Gelato Store" description="Enter your API credentials to enable product creation" isActive={currentStep === 1} isCompleted={isConnected}>
+        {(!isConnected || currentStep === 1) && <ApiConnection onConnect={handleConnect} isConnected={isConnected} />}
       </StepCard>
 
-      {/* Step 2 */}
-      <StepCard
-        step={2}
-        title="Upload Your Design Files"
-        description="Select images and configure processing options"
-        isActive={currentStep === 2}
-        isCompleted={images.length > 0}
-      >
-        {(currentStep === 2 || images.length > 0) && isConnected && (
-          <ImageUploader
-            onImagesChange={handleImagesChange}
-            processingOptions={processingOptions}
-            onOptionsChange={setProcessingOptions}
-          />
-        )}
+      <StepCard step={2} title="Upload Your Design Files" description="Select images and configure processing options" isActive={currentStep === 2} isCompleted={images.length > 0}>
+        {(currentStep === 2 || images.length > 0) && isConnected && <ImageUploader onImagesChange={handleImagesChange} processingOptions={processingOptions} onOptionsChange={setProcessingOptions} />}
       </StepCard>
 
-      {/* Step 3 */}
-      <StepCard
-        step={3}
-        title="Choose Example Product"
-        description="Select a product from your catalog to use as a template"
-        isActive={currentStep === 3}
-        isCompleted={!!selectedProduct}
-      >
-        {(currentStep === 3 || selectedProduct) && images.length > 0 && (
-          <ProductSelector onProductSelect={handleProductSelect} selectedProduct={selectedProduct} />
-        )}
+      <StepCard step={3} title="Choose Example Product" description="Select a product from your catalog to use as a template" isActive={currentStep === 3} isCompleted={!!selectedProduct}>
+        {(currentStep === 3 || selectedProduct) && images.length > 0 && <ProductSelector onProductSelect={handleProductSelect} selectedProduct={selectedProduct} />}
       </StepCard>
 
-      {/* Step 4 */}
-      <StepCard
-        step={4}
-        title="Product Creation Rules"
-        description="Set up titles, descriptions, and tags for bulk creation"
-        isActive={currentStep === 4}
-        isCompleted={createdProducts.length > 0}
-      >
+      <StepCard step={4} title="Product Creation Rules" description="Set up titles, descriptions, and tags for bulk creation" isActive={currentStep === 4} isCompleted={createdProducts.length > 0}>
         {currentStep === 4 && selectedProduct && (
           <div className="space-y-6">
             <ProductRules rules={rules} onRulesChange={setRules} onSave={handleSaveRules} />
@@ -530,27 +425,16 @@ export function BulkCreator() {
                 </div>
 
                 <div className="grid grid-cols-3 gap-4 text-sm text-muted-foreground mb-6">
-                  <div>
-                    <div className="font-medium text-foreground">{images.length}</div>
-                    <div>Images Ready</div>
-                  </div>
-                  <div>
-                    <div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div>
-                    <div>Product Variants</div>
-                  </div>
-                  <div>
-                    <div className="font-medium text-foreground">
-                      {images.length * ((template?.variants || []).length || 0)}
-                    </div>
-                    <div>Total Products</div>
-                  </div>
+                  <div><div className="font-medium text-foreground">{images.length}</div><div>Images Ready</div></div>
+                  <div><div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div><div>Product Variants</div></div>
+                  <div><div className="font-medium text-foreground">{images.length * ((template?.variants || []).length || 0)}</div><div>Total Uploads</div></div>
                 </div>
 
                 {isCreating ? (
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Creating products...</span>
+                      <span>Processing and Uploading...</span>
                     </div>
                     <Progress value={creationProgress} />
                     <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% complete</p>
@@ -561,17 +445,10 @@ export function BulkCreator() {
                       <CheckCircle className="h-5 w-5" />
                       <span className="font-medium">Products Created Successfully!</span>
                     </div>
-                    <div className="text-sm text-muted-foreground">Created {successCount} products in your Gelato store</div>
                   </div>
                 ) : (
-                  <Button
-                    onClick={handleCreateProducts}
-                    disabled={!images.length || !selectedProduct}
-                    size="lg"
-                    className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
-                  >
-                    <Rocket className="h-4 w-4 mr-2" />
-                    Create {images.length} Products
+                  <Button onClick={handleCreateProducts} disabled={!images.length || !selectedProduct} size="lg" className="bg-gradient-to-r from-success to-success/80 text-white">
+                    <Rocket className="h-4 w-4 mr-2" /> Create {images.length} Products
                   </Button>
                 )}
               </CardContent>
