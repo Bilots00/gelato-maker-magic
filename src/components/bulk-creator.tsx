@@ -86,42 +86,20 @@ function extFromType(t: string) {
 }
 
 // Loader più robusto + revoke dell'URL per evitare leak
-async function fileToImage(file: File): Promise<HTMLImageElement> {
+// Restituisce anche l'url per poterlo revocare e liberare memoria
+async function fileToImage(file: File): Promise<{ img: HTMLImageElement; url: string }> {
   const url = URL.createObjectURL(file);
-  try {
-    const img = new Image();
-    img.src = url;
-    // decode() non è sempre supportato in tutti i formati, fallback a onload
-    if ("decode" in img) {
-      await (img as any).decode().catch(
-        () =>
-          new Promise<void>((res, rej) => {
-            img.onload = () => res();
-            img.onerror = (e) => rej(e);
-          })
-      );
-    } else {
-      await new Promise<void>((res, rej) => {
-        img.onload = () => res();
-        img.onerror = (e) => rej(e);
-      });
-    }
-    return img;
-  } finally {
-    // non revochiamo subito: Chrome a volte usa il blob ancora durante drawImage
-    // verrà garbage-collectato da solo; niente revoke immediato qui.
-  }
+  const img = new Image();
+  img.src = url;
+  
+  await new Promise<void>((res, rej) => {
+    img.onload = () => res();
+    img.onerror = (e) => rej(e);
+  });
+  
+  return { img, url };
 }
 
-/**
- * stretch  -> riempi TUTTO distorcendo (NO crop, NO bordi)
- * preserve -> contain + center (mantieni ratio, possibili bordi)
- * exact    -> nessuna trasformazione
- *
- * Protezioni anti "EncodingError":
- * - limite dimensione massima canvas (larghezza/altezza/pixel totali)
- * - scala sicura anche quando upscale=true
- */
 async function transformForVariant(
   file: File,
   targetW: number,
@@ -131,26 +109,21 @@ async function transformForVariant(
 ): Promise<Blob | null> {
   if (fitMode === "exact") return null;
 
-  const img = await fileToImage(file);
+  // Usa la nuova funzione e tieni traccia dell'URL
+  const { img, url } = await fileToImage(file);
   const type = file.type || "image/png";
   const ext = extFromType(type);
 
-  // Limiti "safe" per Canvas (puoi alzarli se la tua macchina regge)
-  const MAX_W = 8192;                 // lim. per lato
+  const MAX_W = 8192;
   const MAX_H = 8192;
-  const MAX_PIXELS = 48_000_000;      // ~48 MP
+  const MAX_PIXELS = 48_000_000;
 
-  // Scala base: mantieni sempre il ratio della PRINT AREA (targetW:targetH).
-  // Se non fai upscale, riduci in base all'immagine sorgente.
   const scaleBySource = Math.min(
     img.naturalWidth / targetW,
     img.naturalHeight / targetH
   );
 
-  // Con upscale=true posso arrivare a 1, con upscale=false non supero la sorgente
   let scale = upscale ? 1 : Math.min(1, scaleBySource);
-
-  // Applica cap per non superare i limiti del canvas
   const capBySide = Math.min(MAX_W / targetW, MAX_H / targetH, 1);
   const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (targetW * targetH)));
   const safeCap = Math.min(capBySide, capByPixels);
@@ -166,10 +139,8 @@ async function transformForVariant(
   ctx.clearRect(0, 0, canvasW, canvasH);
 
   if (fitMode === "stretch") {
-    // === STRETCH: distorsione piena per riempire, NES-SUN CROP ===
     ctx.drawImage(img, 0, 0, canvasW, canvasH);
   } else {
-    // === PRESERVE: contain + center ===
     const srcR = img.naturalWidth / img.naturalHeight;
     const dstR = canvasW / canvasH;
     let drawW: number, drawH: number;
@@ -182,15 +153,19 @@ async function transformForVariant(
     }
     const dx = Math.round((canvasW - drawW) / 2);
     const dy = Math.round((canvasH - drawH) / 2);
-    ctx.drawImage(img, dx, dy, drawW, drawH);
+    ctx.drawImage(img, dx, drawW, drawH);
   }
 
   const quality = /jpe?g/i.test(type) ? 0.92 : 1;
 
-  // toBlob può comunque fallire: catturiamo e segnaliamo
   return await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
       (b) => {
+        // Pulizia Immediata della memoria (MOLTO IMPORTANTE PER I FILE GRANDI)
+        URL.revokeObjectURL(url);
+        canvas.width = 0;
+        canvas.height = 0;
+        
         if (!b) {
           reject(new DOMException("Canvas encoding failed", "EncodingError"));
         } else {
@@ -322,92 +297,98 @@ export function BulkCreator() {
         return;
       }
 
-      // Prepara prodotti: per OGNI immagine, genera tutte le varianti del template
-      const products = await Promise.all(
-        images.map(async (image, index) => {
-          // 1) Titolo
-          let title: string;
-          if (rules.titleMode === "filename") {
-            title = image.name.replace(/\.[^/.]+$/, "");
-          } else if (rules.titleMode === "ai-simple") {
-            title = `AI Generated Title ${index + 1}`;
-          } else {
-            title = `Custom Product ${index + 1}`;
-          }
-          if (rules.includeCustomTitle && rules.titleCustomText) {
-            title += ` ${rules.titleCustomText}`;
-          }
+      // VERO FIX: Array processati SEQUENZIALMENTE invece che in parallelo con Promise.all
+      const products = [];
+      let processedImages = 0;
 
-          // 2) Per ogni variante calcolo dimensioni target e preparo l'upload
-          const variantsPayload = await Promise.all(
-            tplVariants.map(async (v: any) => {
-              const placeholderName =
-                v?.imagePlaceholders?.[0]?.name ||
-                tpl?.imagePlaceholders?.[0]?.name ||
-                "front";
+      for (let i = 0; i < images.length; i++) {
+        const image = images[i];
+        
+        // 1) Titolo
+        let title: string;
+        if (rules.titleMode === "filename") {
+          title = image.name.replace(/\.[^/.]+$/, "");
+        } else if (rules.titleMode === "ai-simple") {
+          title = `AI Generated Title ${i + 1}`;
+        } else {
+          title = `Custom Product ${i + 1}`;
+        }
+        if (rules.includeCustomTitle && rules.titleCustomText) {
+          title += ` ${rules.titleCustomText}`;
+        }
 
-              const inches = parseVariantInches(v?.title) || [12, 16]; // fallback
-              const DPI = processingOptions.upscale ? 300 : 150;
-              const targetW = Math.round(inches[0] * DPI);
-              const targetH = Math.round(inches[1] * DPI);
+        // 2) Cicla in SEQUENZA le varianti, liberando la RAM ad ogni step
+        const variantsPayload = [];
+        for (const v of tplVariants) {
+          const placeholderName =
+            v?.imagePlaceholders?.[0]?.name ||
+            tpl?.imagePlaceholders?.[0]?.name ||
+            "front";
 
-              // Deve esistere anche fuori dall'if
-              let fileToUpload: File = image.file;
+          const inches = parseVariantInches(v?.title) || [12, 16];
+          const DPI = processingOptions.upscale ? 300 : 150;
+          const targetW = Math.round(inches[0] * DPI);
+          const targetH = Math.round(inches[1] * DPI);
 
-              // "stretch" = distorsione piena, "preserve" = contain + centering, "exact" = usa originale
-              const transformed = await transformForVariant(
-                image.file,
-                targetW,
-                targetH,
-                processingOptions.fitMode,   // "stretch" | "preserve" | "exact"
-                processingOptions.upscale
-              );
+          let fileToUpload: File = image.file;
 
-              if (transformed) {
-                const baseType = image.file.type || "image/png";
-                const ext =
-                  baseType.includes("png") ? "png" :
-                  baseType.includes("webp") ? "webp" :
-                  (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
-
-                const fname = image.name.replace(/\.[^/.]+$/, "");
-                fileToUpload = new File(
-                  [transformed],
-                  `${fname}-${targetW}x${targetH}.${ext}`,
-                  { type: baseType }
-                );
-              }
-
-              const safeName = (fileToUpload.name || image.name)
-                .toLowerCase()
-                .replace(/\s+/g, "-")
-                .replace(/[^a-z0-9.-]/g, "");
-
-              const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
-              const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
-
-              return {
-                templateVariantId: v.id,
-                imagePlaceholders: [
-                  {
-                    name: placeholderName,
-                    fileUrl: publicUrl,
-                  },
-                ],
-              };
-            })
+          const transformed = await transformForVariant(
+            image.file,
+            targetW,
+            targetH,
+            processingOptions.fitMode,
+            processingOptions.upscale
           );
 
-          return {
-            title,
-            description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
-            tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
-            variants: variantsPayload, // <— tutte le varianti del template
-          };
-        })
-      );
+          if (transformed) {
+            const baseType = image.file.type || "image/png";
+            const ext =
+              baseType.includes("png") ? "png" :
+              baseType.includes("webp") ? "webp" :
+              (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
 
-      // invio alla edge
+            const fname = image.name.replace(/\.[^/.]+$/, "");
+            fileToUpload = new File(
+              [transformed],
+              `${fname}-${targetW}x${targetH}.${ext}`,
+              { type: baseType }
+            );
+          }
+
+          const safeName = (fileToUpload.name || image.name)
+            .toLowerCase()
+            .replace(/\s+/g, "-")
+            .replace(/[^a-z0-9.-]/g, "");
+
+          const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+          
+          // Upload su Cloudflare in attesa prima di passare al successivo Canvas
+          const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+
+          variantsPayload.push({
+            templateVariantId: v.id,
+            imagePlaceholders: [
+              {
+                name: placeholderName,
+                fileUrl: publicUrl,
+              },
+            ],
+          });
+        }
+
+        products.push({
+          title,
+          description: rules.descriptionCustomHTML || "Generated by Gelato Bulk Creator",
+          tags: rules.tagsCustom.length > 0 ? rules.tagsCustom : ["gelato", "bulk-created"],
+          variants: variantsPayload,
+        });
+
+        // Aggiorna progress bar per ogni immagine completata
+        processedImages++;
+        setCreationProgress((processedImages / images.length) * 50); // Mettiamo il 50% max fino alla bulk creation vera
+      }
+
+      // 3) Una volta generate sequenzialmente tutte le immagini su R2, chiama l'API Gelato (Worker)
       const data = await bulkCreate({
         templateId: tpl.id,
         publish: true,
@@ -421,7 +402,7 @@ export function BulkCreator() {
       setCreationProgress(100);
       setIsCreating(false);
 
-      const successCount = results.filter((r: any) => r.status === "active").length;
+      const successCount = results.filter((r: any) => r.status === "active" || r.status === "created_in_background").length;
       const errorCount = results.filter((r: any) => r.status === "error").length;
 
       if (successCount > 0) {
