@@ -10,7 +10,6 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { CheckCircle, Loader2, Package, Rocket } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { bulkCreate, getTemplate } from "@/lib/supabaseFetch";
 
 const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
 
@@ -46,14 +45,14 @@ type ProductRulesType = {
 };
 
 const defaultRules: ProductRulesType = {
-  titleMode: "filename", // <-- CAMBIATO DA "ai-simple"
+  titleMode: "filename", 
   titleMaxWords: 8,
   titleCustomText: "",
-  descriptionMode: "copy", // <-- CAMBIATO DA "ai"
+  descriptionMode: "copy", 
   descriptionParagraphs: 2,
   descriptionSentences: 3,
   descriptionCustomHTML: "",
-  tagsMode: "copy", // <-- CAMBIATO DA "ai"
+  tagsMode: "copy", 
   tagsMaxCount: 10,
   tagsCustom: [],
   includeCustomTitle: false,
@@ -63,30 +62,35 @@ const defaultRules: ProductRulesType = {
 const isUuid = (s?: string) =>
   !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
-// --- helpers: parse variant title -> inches ---
-const INCH_PER_CM = 1 / 2.54;
+// ==========================================
+// HELPER PER RAGGRUPPAMENTO SMART E RISOLUZIONE
+// ==========================================
 
-function parseVariantInches(title?: string): [number, number] | null {
-  if (!title) return null;
-  // es: "12x16 in - 30x40 cm"
-  const mIn = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*in/i);
-  if (mIn) return [parseFloat(mIn[1]), parseFloat(mIn[2])];
-
-  const mCm = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*cm/i);
-  if (mCm) {
-    const w = parseFloat(mCm[1]) * INCH_PER_CM;
-    const h = parseFloat(mCm[2]) * INCH_PER_CM;
-    return [w, h];
-  }
-  return null;
+function getFileRatioTag(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.includes('(3x4)') || lower.includes('3x4')) return '3x4';
+  if (lower.includes('(5x7)') || lower.includes('5x7') || lower.includes('iso')) return '5x7';
+  if (lower.includes('(1x1)') || lower.includes('1x1')) return '1x1';
+  return 'default';
 }
 
-function extFromType(t: string) {
-  return t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg";
+function getCleanBaseTitle(filename: string): string {
+  let base = filename.replace(/\.[^/.]+$/, ""); 
+  base = base.replace(/\s*(?:\bISO\b)?\s*\([^)]*\)/i, '').trim(); 
+  return base.charAt(0).toUpperCase() + base.slice(1);
 }
 
-// Loader più robusto + revoke dell'URL per evitare leak
-// Restituisce anche l'url per poterlo revocare e liberare memoria
+function getVariantRatioTag(variantTitle: string): string {
+  const lower = (variantTitle || "").toLowerCase();
+  if (lower.includes('30x40') || lower.includes('40x30') || lower.includes('60x45') || lower.includes('75x100')) return '3x4';
+  if (lower.includes('50x70') || lower.includes('70x50') || lower.includes('100x140') || lower.includes('140x100')) return '5x7';
+  if (lower.includes('30x30') || lower.includes('50x50') || lower.includes('100x100') || lower.includes('70x70')) return '1x1';
+  return 'default';
+}
+
+// ==========================================
+// OTTIMIZZATORE DI RETE (Salva da crash Cloudflare mantenendo qualità ESTREMA)
+// ==========================================
 async function fileToImage(file: File): Promise<{ img: HTMLImageElement; url: string }> {
   const url = URL.createObjectURL(file);
   const img = new Image();
@@ -100,108 +104,63 @@ async function fileToImage(file: File): Promise<{ img: HTMLImageElement; url: st
   return { img, url };
 }
 
-async function transformForVariant(
-  file: File,
-  targetW: number,
-  targetH: number,
-  fitMode: "stretch" | "preserve" | "exact",
-  upscale: boolean
-): Promise<Blob | null> {
-  if (fitMode === "exact") return null;
-
-  // Usa la nuova funzione e tieni traccia dell'URL
+async function optimizeImageForUpload(file: File): Promise<Blob> {
   const { img, url } = await fileToImage(file);
-  const type = file.type || "image/png";
-  const ext = extFromType(type);
+  
+  // Limiti massimi impostati ALTIMISSI per non perdere qualità di stampa (60 Megapixel)
+  // Questo abbassa i file da 100MB a ~12MB, evadendo il blocco di Cloudflare!
+  const MAX_W = 9000;
+  const MAX_H = 9000;
+  const MAX_PIXELS = 60_000_000; 
 
-  const MAX_W = 8192;
-  const MAX_H = 8192;
-  const MAX_PIXELS = 48_000_000;
+  const scaleBySource = Math.min(1, MAX_W / img.naturalWidth, MAX_H / img.naturalHeight);
+  const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (img.naturalWidth * img.naturalHeight)));
+  const finalScale = Math.min(scaleBySource, capByPixels);
 
-  const scaleBySource = Math.min(
-    img.naturalWidth / targetW,
-    img.naturalHeight / targetH
-  );
-
-  let scale = upscale ? 1 : Math.min(1, scaleBySource);
-  const capBySide = Math.min(MAX_W / targetW, MAX_H / targetH, 1);
-  const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (targetW * targetH)));
-  const safeCap = Math.min(capBySide, capByPixels);
-
-  scale = Math.min(scale, safeCap);
-  const canvasW = Math.max(1, Math.round(targetW * scale));
-  const canvasH = Math.max(1, Math.round(targetH * scale));
+  const canvasW = Math.max(1, Math.round(img.naturalWidth * finalScale));
+  const canvasH = Math.max(1, Math.round(img.naturalHeight * finalScale));
 
   const canvas = document.createElement("canvas");
   canvas.width = canvasW;
   canvas.height = canvasH;
   const ctx = canvas.getContext("2d")!;
-  ctx.clearRect(0, 0, canvasW, canvasH);
-
-  if (fitMode === "stretch") {
-    ctx.drawImage(img, 0, 0, canvasW, canvasH);
-  } else {
-    const srcR = img.naturalWidth / img.naturalHeight;
-    const dstR = canvasW / canvasH;
-    let drawW: number, drawH: number;
-    if (srcR > dstR) {
-      drawW = canvasW;
-      drawH = Math.round(canvasW / srcR);
-    } else {
-      drawH = canvasH;
-      drawW = Math.round(canvasH * srcR);
-    }
-    const dx = Math.round((canvasW - drawW) / 2);
-    const dy = Math.round((canvasH - drawH) / 2);
-    ctx.drawImage(img, dx, drawW, drawH);
-  }
-
-  const quality = /jpe?g/i.test(type) ? 0.92 : 1;
+  ctx.drawImage(img, 0, 0, canvasW, canvasH);
 
   return await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
       (b) => {
-        // Pulizia Immediata della memoria (MOLTO IMPORTANTE PER I FILE GRANDI)
         URL.revokeObjectURL(url);
         canvas.width = 0;
         canvas.height = 0;
-        
-        if (!b) {
-          reject(new DOMException("Canvas encoding failed", "EncodingError"));
-        } else {
-          resolve(b);
-        }
+        if (!b) reject(new DOMException("Canvas encoding failed", "EncodingError"));
+        else resolve(b);
       },
-      type.includes("image/") ? type : `image/${ext}`,
-      quality
+      "image/jpeg",
+      0.96 // Qualità JPEG Altissima
     );
   });
 }
 
-async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const fileName = destPath.split('/').pop() || "image.png";
-  
-  // INVIA I BYTE PURI, NON USARE FORMDATA!
-  // Passiamo il nome del file nell'URL così il Worker lo legge da lì
-  const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(fileName)}`, {
+async function uploadAndGetPublicUrl(inputBlob: Blob, exactFileName: string) {
+  const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(exactFileName)}`, {
     method: "POST",
     headers: {
-      "Content-Type": input.type || "application/octet-stream"
+      "Content-Type": "image/jpeg"
     },
-    body: input // <- Passiamo direttamente il File/Blob
+    body: inputBlob 
   });
 
   if (!uploadRes.ok) {
     const errorText = await uploadRes.text();
     console.error("Cloudflare upload error:", errorText);
-    throw new Error("Errore durante il caricamento dell'immagine su Cloudflare R2");
+    throw new Error("Errore durante il caricamento su Cloudflare R2. File troppo grande o connessione assente.");
   }
 
   const cloudflareData = await uploadRes.json();
   return cloudflareData.url; 
 }
 
-// ---------- componente ----------
+// ---------- COMPONENTE PRINCIPALE ----------
 export function BulkCreator() {
   const { toast } = useToast();
   const [currentStep, setCurrentStep] = useState(1);
@@ -222,7 +181,6 @@ export function BulkCreator() {
   const [createdProducts, setCreatedProducts] = useState<any[]>([]);
   const [template, setTemplate] = useState<any | null>(null);
 
-  // ---- bootstrap credenziali da localStorage ----
   useEffect(() => {
     try {
       const raw = localStorage.getItem("gelato.creds");
@@ -247,7 +205,6 @@ export function BulkCreator() {
 
   const handleImagesChange = (newImages: ImageFile[]) => {
     setImages(newImages);
-    // avanza almeno allo step 3
     setCurrentStep((prev) => (newImages.length > 0 ? Math.max(prev, 3) : prev));
   };
 
@@ -266,7 +223,7 @@ export function BulkCreator() {
     if (!isUuid(selectedProduct.id)) {
       toast({
         title: "Invalid template",
-        description: "In Step 3 carica un vero Template ID Gelato (UUID) e premi “Load Template”.",
+        description: "Carica un VERO Template ID Gelato (UUID)",
         variant: "destructive",
       });
       return;
@@ -281,15 +238,11 @@ export function BulkCreator() {
 
       if (!chosenTemplateId) {
         setIsCreating(false);
-        toast({
-          title: "Template ID mancante",
-          description: "Inserisci un Template ID Gelato (UUID)",
-          variant: "destructive",
-        });
+        toast({ title: "Template ID mancante", variant: "destructive" });
         return;
       }
 
-      // CHIAMATA DIRETTA AL CLOUDFLARE WORKER (Invece di Supabase)
+      // 1. CHIAMATA PER OTTENERE IL TEMPLATE
       const tplRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/gelato-get-template?templateId=${chosenTemplateId}`);
       if (!tplRes.ok) throw new Error("Errore nel download del Template da Gelato");
       const tpl = await tplRes.json();
@@ -302,82 +255,63 @@ export function BulkCreator() {
         return;
       }
 
-      // VERO FIX: Array processati SEQUENZIALMENTE
-      const products = [];
-      let processedImages = 0;
+      // 2. RAGGRUPPAMENTO SMART DEI FILE (Uniamo 3x4 e 5x7)
+      const groupedProducts: Record<string, Record<string, ImageFile>> = {};
+      
+      for (const img of images) {
+        const baseTitle = getCleanBaseTitle(img.name);
+        const ratioTag = getFileRatioTag(img.name);
+        if (!groupedProducts[baseTitle]) groupedProducts[baseTitle] = {};
+        groupedProducts[baseTitle][ratioTag] = img;
+      }
 
-      for (let i = 0; i < images.length; i++) {
-        const image = images[i];
+      // 3. PROCESSO DI UPLOAD E CREAZIONE PRODOTTI
+      const products = [];
+      let processedGroups = 0;
+      const totalGroups = Object.keys(groupedProducts).length;
+
+      for (const [baseTitle, fileMap] of Object.entries(groupedProducts)) {
         
-        // 1) Titolo
+        // Titolo
         let title: string;
         if (rules.titleMode === "filename") {
-          title = image.name.replace(/\.[^/.]+$/, "");
+          title = baseTitle;
         } else if (rules.titleMode === "ai-simple") {
-          title = `AI Generated Title ${i + 1}`;
+          title = `AI Generated Title ${processedGroups + 1}`;
         } else {
-          title = `Custom Product ${i + 1}`;
+          title = `Custom Product ${processedGroups + 1}`;
         }
         if (rules.includeCustomTitle && rules.titleCustomText) {
           title += ` ${rules.titleCustomText}`;
         }
 
-        // 2) Cicla in SEQUENZA le varianti
+        // Upload dei file su R2 (Solo UNA volta per Aspect Ratio)
+        const uploadedUrls: Record<string, string> = {};
+        for (const [ratioTag, imageObj] of Object.entries(fileMap)) {
+           // Ottimizza per Cloudflare (salva la qualità, riduce i MB in eccesso per non crashare)
+           const optimizedBlob = await optimizeImageForUpload(imageObj.file);
+
+           // Nomenclatura ESATTA richiesta dallo smistamento ordini
+           let exactFileName = `${baseTitle}.jpg`; 
+           if (ratioTag === '3x4') exactFileName = `${baseTitle} (3x4).jpg`;
+           if (ratioTag === '5x7') exactFileName = `${baseTitle} ISO (5x7).jpg`;
+
+           const publicUrl = await uploadAndGetPublicUrl(optimizedBlob, exactFileName);
+           uploadedUrls[ratioTag] = publicUrl;
+        }
+
+        // Assegnazione logica alle varianti Gelato
         const variantsPayload = [];
         for (const v of tplVariants) {
-          const placeholderName =
-            v?.imagePlaceholders?.[0]?.name ||
-            tpl?.imagePlaceholders?.[0]?.name ||
-            "front";
-
-          const inches = parseVariantInches(v?.title) || [12, 16];
-          const DPI = processingOptions.upscale ? 300 : 150;
-          const targetW = Math.round(inches[0] * DPI);
-          const targetH = Math.round(inches[1] * DPI);
-
-          let fileToUpload: File = image.file;
-
-          const transformed = await transformForVariant(
-            image.file,
-            targetW,
-            targetH,
-            processingOptions.fitMode,
-            processingOptions.upscale
-          );
-
-          if (transformed) {
-            const baseType = image.file.type || "image/png";
-            const ext =
-              baseType.includes("png") ? "png" :
-              baseType.includes("webp") ? "webp" :
-              (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
-
-            const fname = image.name.replace(/\.[^/.]+$/, "");
-            fileToUpload = new File(
-              [transformed],
-              `${fname}-${targetW}x${targetH}.${ext}`,
-              { type: baseType }
-            );
-          }
-
-          const safeName = (fileToUpload.name || image.name)
-            .toLowerCase()
-            .replace(/\s+/g, "-")
-            .replace(/[^a-z0-9.-]/g, "");
-
-          const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+          const placeholderName = v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "front";
+          const variantRatio = getVariantRatioTag(v.title);
           
-          // Upload su Cloudflare in RAW form
-          const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+          // Prende l'URL giusto per il formato della variante
+          const matchedUrl = uploadedUrls[variantRatio] || uploadedUrls['default'] || Object.values(uploadedUrls)[0];
 
           variantsPayload.push({
             templateVariantId: v.id,
-            imagePlaceholders: [
-              {
-                name: placeholderName,
-                fileUrl: publicUrl,
-              },
-            ],
+            imagePlaceholders: [{ name: placeholderName, fileUrl: matchedUrl }],
           });
         }
 
@@ -388,11 +322,11 @@ export function BulkCreator() {
           variants: variantsPayload,
         });
 
-        processedImages++;
-        setCreationProgress((processedImages / images.length) * 50); 
+        processedGroups++;
+        setCreationProgress((processedGroups / totalGroups) * 50); 
       }
 
-      // 3) CHIAMATA DIRETTA AL WORKER PER IL BULK CREATE (bypassa Supabase)
+      // 4. CHIAMATA DIRETTA AL WORKER PER IL BULK CREATE IN GELATO
       const createRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/gelato-bulk-create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -405,7 +339,7 @@ export function BulkCreator() {
         })
       });
 
-      if (!createRes.ok) throw new Error("Errore durante la creazione dei prodotti via Cloudflare");
+      if (!createRes.ok) throw new Error("Errore durante la creazione dei prodotti in Gelato via Cloudflare");
       
       const data = await createRes.json();
       const results = data.results || [];
@@ -419,12 +353,12 @@ export function BulkCreator() {
       if (successCount > 0) {
         toast({
           title: "🎉 Products Created",
-          description: `Created ${successCount} products in your Gelato store. ${errorCount ? `${errorCount} failed.` : ""}`,
+          description: `Created ${successCount} products successfully. ${errorCount ? `${errorCount} failed.` : ""}`,
         });
       } else {
         toast({
           title: "Product Creation Failed",
-          description: "Failed to create products. Check console for details.",
+          description: "Failed to create products. Check server logs.",
           variant: "destructive",
         });
       }
@@ -433,12 +367,17 @@ export function BulkCreator() {
       setIsCreating(false);
       setCreationProgress(0);
       toast({
-        title: "Error creating products",
-        description: error?.message ?? "Failed to create products",
+        title: "Errore Rete/Cloudflare",
+        description: error?.message ?? "Operazione fallita",
         variant: "destructive",
       });
     }
   };
+
+  const totalGroupsCalculated = Object.keys(images.reduce((acc: any, img) => {
+    acc[getCleanBaseTitle(img.name)] = true;
+    return acc;
+  }, {})).length;
 
   const completedSteps = [isConnected, images.length > 0, !!selectedProduct, createdProducts.length > 0].filter(Boolean).length;
   const successCount = createdProducts.filter((r: any) => r.status === "active").length;
@@ -476,7 +415,7 @@ export function BulkCreator() {
       <StepCard
         step={2}
         title="Upload Your Design Files"
-        description="Select images and configure processing options"
+        description="I file 3x4 e 5x7 verranno uniti in un unico prodotto intelligente"
         isActive={currentStep === 2}
         isCompleted={images.length > 0}
       >
@@ -524,17 +463,17 @@ export function BulkCreator() {
                 <div className="grid grid-cols-3 gap-4 text-sm text-muted-foreground mb-6">
                   <div>
                     <div className="font-medium text-foreground">{images.length}</div>
-                    <div>Images Ready</div>
+                    <div>File Totali Caricati</div>
                   </div>
                   <div>
                     <div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div>
-                    <div>Product Variants</div>
+                    <div>Varianti Gelato</div>
                   </div>
                   <div>
                     <div className="font-medium text-foreground">
-                      {images.length * ((template?.variants || []).length || 0)}
+                      {totalGroupsCalculated}
                     </div>
-                    <div>Total Products</div>
+                    <div>Prodotti Finiti Unici</div>
                   </div>
                 </div>
 
@@ -542,7 +481,7 @@ export function BulkCreator() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Creating products...</span>
+                      <span>Ottimizzazione e Creazione in corso...</span>
                     </div>
                     <Progress value={creationProgress} />
                     <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% complete</p>
@@ -553,7 +492,7 @@ export function BulkCreator() {
                       <CheckCircle className="h-5 w-5" />
                       <span className="font-medium">Products Created Successfully!</span>
                     </div>
-                    <div className="text-sm text-muted-foreground">Created {successCount} products in your Gelato store</div>
+                    <div className="text-sm text-muted-foreground">Created {successCount} grouped products in your store</div>
                   </div>
                 ) : (
                   <Button
@@ -563,7 +502,7 @@ export function BulkCreator() {
                     className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
                   >
                     <Rocket className="h-4 w-4 mr-2" />
-                    Create {images.length} Products
+                    Crea {totalGroupsCalculated} Prodotti Raggruppati
                   </Button>
                 )}
               </CardContent>
