@@ -63,7 +63,7 @@ const isUuid = (s?: string) =>
   !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
 // ==========================================
-// HELPER PER RAGGRUPPAMENTO SMART E RISOLUZIONE
+// HELPER PER RAGGRUPPAMENTO (SMART GROUPING)
 // ==========================================
 
 function getFileRatioTag(filename: string): string {
@@ -89,76 +89,28 @@ function getVariantRatioTag(variantTitle: string): string {
 }
 
 // ==========================================
-// OTTIMIZZATORE DI RETE (Salva da crash Cloudflare mantenendo qualità ESTREMA)
+// MOTORE DI UPLOAD PURO (Zero Compressione, File Intatto)
 // ==========================================
-async function fileToImage(file: File): Promise<{ img: HTMLImageElement; url: string }> {
-  const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.src = url;
-  
-  await new Promise<void>((res, rej) => {
-    img.onload = () => res();
-    img.onerror = (e) => rej(e);
-  });
-  
-  return { img, url };
-}
-
-async function optimizeImageForUpload(file: File): Promise<Blob> {
-  const { img, url } = await fileToImage(file);
-  
-  // Limiti massimi impostati ALTIMISSI per non perdere qualità di stampa (60 Megapixel)
-  // Questo abbassa i file da 100MB a ~12MB, evadendo il blocco di Cloudflare!
-  const MAX_W = 9000;
-  const MAX_H = 9000;
-  const MAX_PIXELS = 60_000_000; 
-
-  const scaleBySource = Math.min(1, MAX_W / img.naturalWidth, MAX_H / img.naturalHeight);
-  const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (img.naturalWidth * img.naturalHeight)));
-  const finalScale = Math.min(scaleBySource, capByPixels);
-
-  const canvasW = Math.max(1, Math.round(img.naturalWidth * finalScale));
-  const canvasH = Math.max(1, Math.round(img.naturalHeight * finalScale));
-
-  const canvas = document.createElement("canvas");
-  canvas.width = canvasW;
-  canvas.height = canvasH;
-  const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(img, 0, 0, canvasW, canvasH);
-
-  return await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => {
-        URL.revokeObjectURL(url);
-        canvas.width = 0;
-        canvas.height = 0;
-        if (!b) reject(new DOMException("Canvas encoding failed", "EncodingError"));
-        else resolve(b);
-      },
-      "image/jpeg",
-      0.96 // Qualità JPEG Altissima
-    );
-  });
-}
-
-async function uploadAndGetPublicUrl(inputBlob: Blob, exactFileName: string) {
+async function uploadOriginalFile(file: File, exactFileName: string) {
+  // Invio in Direct Stream: Non carica il file in RAM, lo passa a pacchetti di rete.
   const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(exactFileName)}`, {
     method: "POST",
     headers: {
-      "Content-Type": "image/jpeg"
+      "Content-Type": file.type || "application/octet-stream"
     },
-    body: inputBlob 
+    body: file 
   });
 
   if (!uploadRes.ok) {
     const errorText = await uploadRes.text();
     console.error("Cloudflare upload error:", errorText);
-    throw new Error("Errore durante il caricamento su Cloudflare R2. File troppo grande o connessione assente.");
+    throw new Error(`Upload fallito (Codice: ${uploadRes.status}). Controlla che il file sia sotto i 100MB.`);
   }
 
   const cloudflareData = await uploadRes.json();
   return cloudflareData.url; 
 }
+
 
 // ---------- COMPONENTE PRINCIPALE ----------
 export function BulkCreator() {
@@ -242,7 +194,7 @@ export function BulkCreator() {
         return;
       }
 
-      // 1. CHIAMATA PER OTTENERE IL TEMPLATE
+      // 1. OTTENGO IL TEMPLATE
       const tplRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/gelato-get-template?templateId=${chosenTemplateId}`);
       if (!tplRes.ok) throw new Error("Errore nel download del Template da Gelato");
       const tpl = await tplRes.json();
@@ -255,7 +207,7 @@ export function BulkCreator() {
         return;
       }
 
-      // 2. RAGGRUPPAMENTO SMART DEI FILE (Uniamo 3x4 e 5x7)
+      // 2. RAGGRUPPAMENTO SMART 
       const groupedProducts: Record<string, Record<string, ImageFile>> = {};
       
       for (const img of images) {
@@ -265,14 +217,13 @@ export function BulkCreator() {
         groupedProducts[baseTitle][ratioTag] = img;
       }
 
-      // 3. PROCESSO DI UPLOAD E CREAZIONE PRODOTTI
+      // 3. UPLOAD SEQUENZIALE E CREAZIONE
       const products = [];
       let processedGroups = 0;
       const totalGroups = Object.keys(groupedProducts).length;
 
       for (const [baseTitle, fileMap] of Object.entries(groupedProducts)) {
         
-        // Titolo
         let title: string;
         if (rules.titleMode === "filename") {
           title = baseTitle;
@@ -285,28 +236,24 @@ export function BulkCreator() {
           title += ` ${rules.titleCustomText}`;
         }
 
-        // Upload dei file su R2 (Solo UNA volta per Aspect Ratio)
         const uploadedUrls: Record<string, string> = {};
+        
+        // ASPETTA IL CARICAMENTO COMPLETO DI OGNI FILE
         for (const [ratioTag, imageObj] of Object.entries(fileMap)) {
-           // Ottimizza per Cloudflare (salva la qualità, riduce i MB in eccesso per non crashare)
-           const optimizedBlob = await optimizeImageForUpload(imageObj.file);
-
-           // Nomenclatura ESATTA richiesta dallo smistamento ordini
            let exactFileName = `${baseTitle}.jpg`; 
            if (ratioTag === '3x4') exactFileName = `${baseTitle} (3x4).jpg`;
            if (ratioTag === '5x7') exactFileName = `${baseTitle} ISO (5x7).jpg`;
 
-           const publicUrl = await uploadAndGetPublicUrl(optimizedBlob, exactFileName);
+           // Passiamo IL FILE NUDO E CRUDO. Aspettiamo l'esito.
+           const publicUrl = await uploadOriginalFile(imageObj.file, exactFileName);
            uploadedUrls[ratioTag] = publicUrl;
         }
 
-        // Assegnazione logica alle varianti Gelato
         const variantsPayload = [];
         for (const v of tplVariants) {
           const placeholderName = v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "front";
           const variantRatio = getVariantRatioTag(v.title);
           
-          // Prende l'URL giusto per il formato della variante
           const matchedUrl = uploadedUrls[variantRatio] || uploadedUrls['default'] || Object.values(uploadedUrls)[0];
 
           variantsPayload.push({
@@ -326,7 +273,7 @@ export function BulkCreator() {
         setCreationProgress((processedGroups / totalGroups) * 50); 
       }
 
-      // 4. CHIAMATA DIRETTA AL WORKER PER IL BULK CREATE IN GELATO
+      // 4. SOLO DOPO L'UPLOAD: CHIAMATA DIRETTA AL WORKER PER IL BULK CREATE
       const createRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/gelato-bulk-create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -339,7 +286,7 @@ export function BulkCreator() {
         })
       });
 
-      if (!createRes.ok) throw new Error("Errore durante la creazione dei prodotti in Gelato via Cloudflare");
+      if (!createRes.ok) throw new Error("Errore durante la creazione dei prodotti in Gelato");
       
       const data = await createRes.json();
       const results = data.results || [];
@@ -352,22 +299,22 @@ export function BulkCreator() {
 
       if (successCount > 0) {
         toast({
-          title: "🎉 Products Created",
-          description: `Created ${successCount} products successfully. ${errorCount ? `${errorCount} failed.` : ""}`,
+          title: "🎉 Prodotti Creati",
+          description: `Creati ${successCount} prodotti con successo. ${errorCount ? `${errorCount} falliti.` : ""}`,
         });
       } else {
         toast({
-          title: "Product Creation Failed",
-          description: "Failed to create products. Check server logs.",
+          title: "Creazione Fallita",
+          description: "La creazione su Gelato è fallita. Guarda la console per dettagli.",
           variant: "destructive",
         });
       }
     } catch (error: any) {
-      console.error("Error creating products:", error);
+      console.error("Errore irreversibile:", error);
       setIsCreating(false);
       setCreationProgress(0);
       toast({
-        title: "Errore Rete/Cloudflare",
+        title: "Errore Rete/Upload",
         description: error?.message ?? "Operazione fallita",
         variant: "destructive",
       });
@@ -388,21 +335,21 @@ export function BulkCreator() {
       <Card className="border-primary/20 bg-gradient-to-r from-card to-muted/30">
         <CardContent className="p-6">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold">Bulk Product Creation Progress</h2>
+            <h2 className="text-xl font-semibold">Stato Avanzamento Creazione</h2>
             <Badge variant="secondary" className="bg-primary/10 text-primary">
-              Step {currentStep} of 4
+              Step {currentStep} di 4
             </Badge>
           </div>
           <Progress value={(completedSteps / 4) * 100} className="mb-2" />
-          <p className="text-sm text-muted-foreground">{completedSteps}/4 steps completed</p>
+          <p className="text-sm text-muted-foreground">{completedSteps}/4 step completati</p>
         </CardContent>
       </Card>
 
       {/* Step 1 */}
       <StepCard
         step={1}
-        title="Connect Your Gelato Store"
-        description="Enter your API credentials to enable product creation"
+        title="Connetti lo Store Gelato"
+        description="Inserisci le credenziali API"
         isActive={currentStep === 1}
         isCompleted={isConnected}
       >
@@ -414,8 +361,8 @@ export function BulkCreator() {
       {/* Step 2 */}
       <StepCard
         step={2}
-        title="Upload Your Design Files"
-        description="I file 3x4 e 5x7 verranno uniti in un unico prodotto intelligente"
+        title="Carica le Immagini Originali"
+        description="Nessuna compressione. Caricamento diretto in qualità originale."
         isActive={currentStep === 2}
         isCompleted={images.length > 0}
       >
@@ -431,8 +378,8 @@ export function BulkCreator() {
       {/* Step 3 */}
       <StepCard
         step={3}
-        title="Choose Example Product"
-        description="Select a product from your catalog to use as a template"
+        title="Scegli Template"
+        description="Carica il Template ID di Gelato (UUID)"
         isActive={currentStep === 3}
         isCompleted={!!selectedProduct}
       >
@@ -444,8 +391,8 @@ export function BulkCreator() {
       {/* Step 4 */}
       <StepCard
         step={4}
-        title="Product Creation Rules"
-        description="Set up titles, descriptions, and tags for bulk creation"
+        title="Creazione Definitiva Prodotti"
+        description="Lancio del processo (Upload File Puro -> Generazione su Gelato)"
         isActive={currentStep === 4}
         isCompleted={createdProducts.length > 0}
       >
@@ -457,23 +404,23 @@ export function BulkCreator() {
               <CardContent className="p-6 text-center space-y-4">
                 <div className="flex items-center justify-center space-x-2 mb-4">
                   <Package className="h-6 w-6 text-success" />
-                  <h3 className="text-lg font-semibold">Ready to Create Products</h3>
+                  <h3 className="text-lg font-semibold">Pronto per Creare i Prodotti</h3>
                 </div>
 
                 <div className="grid grid-cols-3 gap-4 text-sm text-muted-foreground mb-6">
                   <div>
                     <div className="font-medium text-foreground">{images.length}</div>
-                    <div>File Totali Caricati</div>
+                    <div>File Pronti all'Upload</div>
                   </div>
                   <div>
                     <div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div>
-                    <div>Varianti Gelato</div>
+                    <div>Varianti Gelato Trovate</div>
                   </div>
                   <div>
                     <div className="font-medium text-foreground">
                       {totalGroupsCalculated}
                     </div>
-                    <div>Prodotti Finiti Unici</div>
+                    <div>Prodotti Singoli Finiti</div>
                   </div>
                 </div>
 
@@ -481,18 +428,18 @@ export function BulkCreator() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Ottimizzazione e Creazione in corso...</span>
+                      <span>Caricamento File Originari e Creazione... Attendi!</span>
                     </div>
                     <Progress value={creationProgress} />
-                    <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% complete</p>
+                    <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% completato</p>
                   </div>
                 ) : hasSuccess ? (
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2 text-success">
                       <CheckCircle className="h-5 w-5" />
-                      <span className="font-medium">Products Created Successfully!</span>
+                      <span className="font-medium">Prodotti Creati con Successo!</span>
                     </div>
-                    <div className="text-sm text-muted-foreground">Created {successCount} grouped products in your store</div>
+                    <div className="text-sm text-muted-foreground">Trovati {successCount} prodotti nel tuo Store Gelato.</div>
                   </div>
                 ) : (
                   <Button
@@ -502,7 +449,7 @@ export function BulkCreator() {
                     className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
                   >
                     <Rocket className="h-4 w-4 mr-2" />
-                    Crea {totalGroupsCalculated} Prodotti Raggruppati
+                    Upload e Crea {totalGroupsCalculated} Prodotti
                   </Button>
                 )}
               </CardContent>
