@@ -89,26 +89,49 @@ function getVariantRatioTag(variantTitle: string): string {
 }
 
 // ==========================================
-// MOTORE DI UPLOAD PURO (Zero Compressione, File Intatto)
+// MOTORE DI UPLOAD MULTIPART (Bypassa limiti rete e crasch Cloudflare)
 // ==========================================
 async function uploadOriginalFile(file: File, exactFileName: string) {
-  // Invio in Direct Stream: Non carica il file in RAM, lo passa a pacchetti di rete.
-  const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(exactFileName)}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": file.type || "application/octet-stream"
-    },
-    body: file 
-  });
+  const BASE_URL = "https://gelato-backend.andrea-bilotta00.workers.dev";
+  const CHUNK_SIZE = 10 * 1024 * 1024; // Fette da 10MB per aggirare il blocco 413
+  
+  // 1. Inizializza
+  const startRes = await fetch(`${BASE_URL}/upload-start?filename=${encodeURIComponent(exactFileName)}`, { method: "POST" });
+  if (!startRes.ok) throw new Error("Errore inizializzazione sul server");
+  const { uploadId, key } = await startRes.json();
 
-  if (!uploadRes.ok) {
-    const errorText = await uploadRes.text();
-    console.error("Cloudflare upload error:", errorText);
-    throw new Error(`Upload fallito (Codice: ${uploadRes.status}). Controlla che il file sia sotto i 100MB.`);
+  const parts = [];
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+  // 2. Invia Fette
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    // file.slice() legge solo quel frammento dal disco: Zero RAM sprecata!
+    const chunk = file.slice(start, end);
+    const partNumber = i + 1;
+
+    const partRes = await fetch(`${BASE_URL}/upload-part?uploadId=${uploadId}&key=${encodeURIComponent(key)}&partNumber=${partNumber}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: chunk
+    });
+
+    if (!partRes.ok) throw new Error(`Upload parte ${partNumber}/${totalChunks} fallito (Rete interrotta)`);
+    const partData = await partRes.json();
+    parts.push(partData);
   }
 
-  const cloudflareData = await uploadRes.json();
-  return cloudflareData.url; 
+  // 3. Completa e Incolla su R2
+  const completeRes = await fetch(`${BASE_URL}/upload-complete?uploadId=${uploadId}&key=${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parts })
+  });
+
+  if (!completeRes.ok) throw new Error("Errore durante l'assemblaggio finale dell'immagine");
+  const finalData = await completeRes.json();
+  return finalData.url; 
 }
 
 
@@ -244,7 +267,7 @@ export function BulkCreator() {
            if (ratioTag === '3x4') exactFileName = `${baseTitle} (3x4).jpg`;
            if (ratioTag === '5x7') exactFileName = `${baseTitle} ISO (5x7).jpg`;
 
-           // Passiamo IL FILE NUDO E CRUDO. Aspettiamo l'esito.
+           // Avvia l'Upload "A Fette" invulnerabile ai drop di connessione
            const publicUrl = await uploadOriginalFile(imageObj.file, exactFileName);
            uploadedUrls[ratioTag] = publicUrl;
         }
@@ -362,7 +385,7 @@ export function BulkCreator() {
       <StepCard
         step={2}
         title="Carica le Immagini Originali"
-        description="Nessuna compressione. Caricamento diretto in qualità originale."
+        description="Nessuna compressione. Caricamento file giganteschi senza limiti via Chunking (pezzetti da 10MB)."
         isActive={currentStep === 2}
         isCompleted={images.length > 0}
       >
@@ -392,7 +415,7 @@ export function BulkCreator() {
       <StepCard
         step={4}
         title="Creazione Definitiva Prodotti"
-        description="Lancio del processo (Upload File Puro -> Generazione su Gelato)"
+        description="Lancio del processo (Upload Multipart -> Generazione su Gelato)"
         isActive={currentStep === 4}
         isCompleted={createdProducts.length > 0}
       >
@@ -428,7 +451,7 @@ export function BulkCreator() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Caricamento File Originari e Creazione... Attendi!</span>
+                      <span>Caricamento a blocchi e Creazione in corso...</span>
                     </div>
                     <Progress value={creationProgress} />
                     <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% completato</p>
@@ -449,7 +472,7 @@ export function BulkCreator() {
                     className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
                   >
                     <Rocket className="h-4 w-4 mr-2" />
-                    Upload e Crea {totalGroupsCalculated} Prodotti
+                    Upload Estremo e Crea {totalGroupsCalculated} Prodotti
                   </Button>
                 )}
               </CardContent>
