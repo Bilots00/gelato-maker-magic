@@ -10,7 +10,6 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { CheckCircle, Loader2, Package, Rocket } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { bulkCreate, getTemplate } from "@/lib/supabaseFetch";
 
 const STORE_ID = import.meta.env.VITE_GELATO_STORE_ID as string | undefined;
 
@@ -46,14 +45,14 @@ type ProductRulesType = {
 };
 
 const defaultRules: ProductRulesType = {
-  titleMode: "filename", // <-- CAMBIATO DA "ai-simple"
+  titleMode: "filename", 
   titleMaxWords: 8,
   titleCustomText: "",
-  descriptionMode: "copy", // <-- CAMBIATO DA "ai"
+  descriptionMode: "copy", 
   descriptionParagraphs: 2,
   descriptionSentences: 3,
   descriptionCustomHTML: "",
-  tagsMode: "copy", // <-- CAMBIATO DA "ai"
+  tagsMode: "copy", 
   tagsMaxCount: 10,
   tagsCustom: [],
   includeCustomTitle: false,
@@ -63,132 +62,44 @@ const defaultRules: ProductRulesType = {
 const isUuid = (s?: string) =>
   !!s?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
-// --- helpers: parse variant title -> inches ---
-const INCH_PER_CM = 1 / 2.54;
 
-function parseVariantInches(title?: string): [number, number] | null {
-  if (!title) return null;
-  // es: "12x16 in - 30x40 cm"
-  const mIn = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*in/i);
-  if (mIn) return [parseFloat(mIn[1]), parseFloat(mIn[2])];
+// ==========================================
+// FUNZIONI HELPER PER IL RAGGRUPPAMENTO
+// ==========================================
 
-  const mCm = title.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*cm/i);
-  if (mCm) {
-    const w = parseFloat(mCm[1]) * INCH_PER_CM;
-    const h = parseFloat(mCm[2]) * INCH_PER_CM;
-    return [w, h];
-  }
-  return null;
+// Estrae il tag ratio dal nome file (es. "All in... (3x4)" -> "3x4")
+function getFileRatioTag(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.includes('(3x4)') || lower.includes('3x4')) return '3x4';
+  if (lower.includes('(5x7)') || lower.includes('5x7') || lower.includes('iso')) return '5x7';
+  if (lower.includes('(1x1)') || lower.includes('1x1')) return '1x1';
+  return 'default';
 }
 
-function extFromType(t: string) {
-  return t.includes("png") ? "png" : t.includes("webp") ? "webp" : "jpg";
+// Pulisce il nome rimuovendo i tag per raggruppare i file simili
+function getCleanBaseTitle(filename: string): string {
+  let base = filename.replace(/\.[^/.]+$/, ""); // via l'estensione
+  base = base.replace(/\s*(?:\bISO\b)?\s*\([^)]*\)/i, '').trim(); // via " (3x4)" o " ISO (5x7)"
+  return base.charAt(0).toUpperCase() + base.slice(1);
 }
 
-// Loader più robusto + revoke dell'URL per evitare leak
-// Restituisce anche l'url per poterlo revocare e liberare memoria
-async function fileToImage(file: File): Promise<{ img: HTMLImageElement; url: string }> {
-  const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.src = url;
-  
-  await new Promise<void>((res, rej) => {
-    img.onload = () => res();
-    img.onerror = (e) => rej(e);
-  });
-  
-  return { img, url };
+// Analizza la stringa variante di Gelato per capire che Ratio le serve
+function getVariantRatioTag(variantTitle: string): string {
+  const lower = (variantTitle || "").toLowerCase();
+  if (lower.includes('30x40') || lower.includes('40x30') || lower.includes('60x45') || lower.includes('75x100')) return '3x4';
+  if (lower.includes('50x70') || lower.includes('70x50') || lower.includes('100x140') || lower.includes('140x100')) return '5x7';
+  if (lower.includes('30x30') || lower.includes('50x50') || lower.includes('100x100') || lower.includes('70x70')) return '1x1';
+  return 'default';
 }
 
-async function transformForVariant(
-  file: File,
-  targetW: number,
-  targetH: number,
-  fitMode: "stretch" | "preserve" | "exact",
-  upscale: boolean
-): Promise<Blob | null> {
-  if (fitMode === "exact") return null;
-
-  // Usa la nuova funzione e tieni traccia dell'URL
-  const { img, url } = await fileToImage(file);
-  const type = file.type || "image/png";
-  const ext = extFromType(type);
-
-  const MAX_W = 8192;
-  const MAX_H = 8192;
-  const MAX_PIXELS = 48_000_000;
-
-  const scaleBySource = Math.min(
-    img.naturalWidth / targetW,
-    img.naturalHeight / targetH
-  );
-
-  let scale = upscale ? 1 : Math.min(1, scaleBySource);
-  const capBySide = Math.min(MAX_W / targetW, MAX_H / targetH, 1);
-  const capByPixels = Math.sqrt(Math.min(1, MAX_PIXELS / (targetW * targetH)));
-  const safeCap = Math.min(capBySide, capByPixels);
-
-  scale = Math.min(scale, safeCap);
-  const canvasW = Math.max(1, Math.round(targetW * scale));
-  const canvasH = Math.max(1, Math.round(targetH * scale));
-
-  const canvas = document.createElement("canvas");
-  canvas.width = canvasW;
-  canvas.height = canvasH;
-  const ctx = canvas.getContext("2d")!;
-  ctx.clearRect(0, 0, canvasW, canvasH);
-
-  if (fitMode === "stretch") {
-    ctx.drawImage(img, 0, 0, canvasW, canvasH);
-  } else {
-    const srcR = img.naturalWidth / img.naturalHeight;
-    const dstR = canvasW / canvasH;
-    let drawW: number, drawH: number;
-    if (srcR > dstR) {
-      drawW = canvasW;
-      drawH = Math.round(canvasW / srcR);
-    } else {
-      drawH = canvasH;
-      drawW = Math.round(canvasH * srcR);
-    }
-    const dx = Math.round((canvasW - drawW) / 2);
-    const dy = Math.round((canvasH - drawH) / 2);
-    ctx.drawImage(img, dx, drawW, drawH);
-  }
-
-  const quality = /jpe?g/i.test(type) ? 0.92 : 1;
-
-  return await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => {
-        // Pulizia Immediata della memoria (MOLTO IMPORTANTE PER I FILE GRANDI)
-        URL.revokeObjectURL(url);
-        canvas.width = 0;
-        canvas.height = 0;
-        
-        if (!b) {
-          reject(new DOMException("Canvas encoding failed", "EncodingError"));
-        } else {
-          resolve(b);
-        }
-      },
-      type.includes("image/") ? type : `image/${ext}`,
-      quality
-    );
-  });
-}
-
-async function uploadAndGetPublicUrl(input: File, destPath: string) {
-  const fileName = destPath.split('/').pop() || "image.png";
-  
-  // INVIA I BYTE PURI, NON USARE FORMDATA!
-  // Passiamo il nome del file nell'URL così il Worker lo legge da lì
-  const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(fileName)}`, {
+// Upload Raw Puro: Salva il file originale alla massima qualità e con il nome esatto
+async function uploadAndGetPublicUrl(input: File, exactFileName: string) {
+  const uploadRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/upload?filename=${encodeURIComponent(exactFileName)}`, {
     method: "POST",
     headers: {
       "Content-Type": input.type || "application/octet-stream"
     },
-    body: input // <- Passiamo direttamente il File/Blob
+    body: input // Passa i byte puri diretti
   });
 
   if (!uploadRes.ok) {
@@ -222,7 +133,6 @@ export function BulkCreator() {
   const [createdProducts, setCreatedProducts] = useState<any[]>([]);
   const [template, setTemplate] = useState<any | null>(null);
 
-  // ---- bootstrap credenziali da localStorage ----
   useEffect(() => {
     try {
       const raw = localStorage.getItem("gelato.creds");
@@ -247,7 +157,6 @@ export function BulkCreator() {
 
   const handleImagesChange = (newImages: ImageFile[]) => {
     setImages(newImages);
-    // avanza almeno allo step 3
     setCurrentStep((prev) => (newImages.length > 0 ? Math.max(prev, 3) : prev));
   };
 
@@ -266,7 +175,7 @@ export function BulkCreator() {
     if (!isUuid(selectedProduct.id)) {
       toast({
         title: "Invalid template",
-        description: "In Step 3 carica un vero Template ID Gelato (UUID) e premi “Load Template”.",
+        description: "In Step 3 carica un vero Template ID Gelato (UUID)",
         variant: "destructive",
       });
       return;
@@ -281,15 +190,11 @@ export function BulkCreator() {
 
       if (!chosenTemplateId) {
         setIsCreating(false);
-        toast({
-          title: "Template ID mancante",
-          description: "Inserisci un Template ID Gelato (UUID)",
-          variant: "destructive",
-        });
+        toast({ title: "Template ID mancante", description: "Inserisci un Template ID Gelato (UUID)", variant: "destructive" });
         return;
       }
 
-      // CHIAMATA DIRETTA AL CLOUDFLARE WORKER (Invece di Supabase)
+      // CHIAMATA DIRETTA AL WORKER (Scarica Template)
       const tplRes = await fetch(`https://gelato-backend.andrea-bilotta00.workers.dev/gelato-get-template?templateId=${chosenTemplateId}`);
       if (!tplRes.ok) throw new Error("Errore nel download del Template da Gelato");
       const tpl = await tplRes.json();
@@ -302,82 +207,67 @@ export function BulkCreator() {
         return;
       }
 
-      // VERO FIX: Array processati SEQUENZIALMENTE
-      const products = [];
-      let processedImages = 0;
+      // -----------------------------------------------------------
+      // FASE 1: SMART GROUPING (Raggruppa 3x4 e 5x7 sotto lo stesso prodotto)
+      // -----------------------------------------------------------
+      const groupedProducts: Record<string, Record<string, File>> = {};
+      
+      for (const img of images) {
+        const baseTitle = getCleanBaseTitle(img.name);
+        const ratioTag = getFileRatioTag(img.name);
+        if (!groupedProducts[baseTitle]) groupedProducts[baseTitle] = {};
+        groupedProducts[baseTitle][ratioTag] = img.file;
+      }
 
-      for (let i = 0; i < images.length; i++) {
-        const image = images[i];
+      // -----------------------------------------------------------
+      // FASE 2: PROCESSO SEQUENZIALE E UPLOAD RAW
+      // -----------------------------------------------------------
+      const products = [];
+      let processedGroups = 0;
+      const totalGroups = Object.keys(groupedProducts).length;
+
+      for (const [baseTitle, fileMap] of Object.entries(groupedProducts)) {
         
-        // 1) Titolo
+        // 1) Titolo Shopify/Gelato
         let title: string;
         if (rules.titleMode === "filename") {
-          title = image.name.replace(/\.[^/.]+$/, "");
+          title = baseTitle;
         } else if (rules.titleMode === "ai-simple") {
-          title = `AI Generated Title ${i + 1}`;
+          title = `AI Generated Title ${processedGroups + 1}`;
         } else {
-          title = `Custom Product ${i + 1}`;
+          title = `Custom Product ${processedGroups + 1}`;
         }
         if (rules.includeCustomTitle && rules.titleCustomText) {
           title += ` ${rules.titleCustomText}`;
         }
 
-        // 2) Cicla in SEQUENZA le varianti
+        // 2) Caricamento su R2 dei file (1 volta per Ratio, Max Qualità)
+        const uploadedUrls: Record<string, string> = {};
+        for (const [ratioTag, rawFile] of Object.entries(fileMap)) {
+           // Generiamo il nome ESATTO che il worker "smistamento-ordini" cercherà
+           let exactFileName = `${baseTitle}.jpg`; // Fallback
+           if (ratioTag === '3x4') exactFileName = `${baseTitle} (3x4).jpg`;
+           if (ratioTag === '5x7') exactFileName = `${baseTitle} ISO (5x7).jpg`;
+
+           // Effettua l'Upload RAW (Non passa più per Canvas!)
+           const publicUrl = await uploadAndGetPublicUrl(rawFile, exactFileName);
+           uploadedUrls[ratioTag] = publicUrl;
+        }
+
+        // 3) Creazione payload delle Varianti Gelato con Assegnazione Intelligente
         const variantsPayload = [];
         for (const v of tplVariants) {
           const placeholderName =
-            v?.imagePlaceholders?.[0]?.name ||
-            tpl?.imagePlaceholders?.[0]?.name ||
-            "front";
-
-          const inches = parseVariantInches(v?.title) || [12, 16];
-          const DPI = processingOptions.upscale ? 300 : 150;
-          const targetW = Math.round(inches[0] * DPI);
-          const targetH = Math.round(inches[1] * DPI);
-
-          let fileToUpload: File = image.file;
-
-          const transformed = await transformForVariant(
-            image.file,
-            targetW,
-            targetH,
-            processingOptions.fitMode,
-            processingOptions.upscale
-          );
-
-          if (transformed) {
-            const baseType = image.file.type || "image/png";
-            const ext =
-              baseType.includes("png") ? "png" :
-              baseType.includes("webp") ? "webp" :
-              (baseType.includes("jpeg") || baseType.includes("jpg")) ? "jpg" : "png";
-
-            const fname = image.name.replace(/\.[^/.]+$/, "");
-            fileToUpload = new File(
-              [transformed],
-              `${fname}-${targetW}x${targetH}.${ext}`,
-              { type: baseType }
-            );
-          }
-
-          const safeName = (fileToUpload.name || image.name)
-            .toLowerCase()
-            .replace(/\s+/g, "-")
-            .replace(/[^a-z0-9.-]/g, "");
-
-          const destPath = `uploads/${image.id}-${Date.now()}-${safeName}`;
+            v?.imagePlaceholders?.[0]?.name || tpl?.imagePlaceholders?.[0]?.name || "front";
           
-          // Upload su Cloudflare in RAW form
-          const publicUrl = await uploadAndGetPublicUrl(fileToUpload, destPath);
+          const variantRatio = getVariantRatioTag(v.title);
+          
+          // Cerchiamo l'URL corrispondente per il Ratio. Se non c'è, usiamo il primo caricato.
+          const matchedUrl = uploadedUrls[variantRatio] || uploadedUrls['default'] || Object.values(uploadedUrls)[0];
 
           variantsPayload.push({
             templateVariantId: v.id,
-            imagePlaceholders: [
-              {
-                name: placeholderName,
-                fileUrl: publicUrl,
-              },
-            ],
+            imagePlaceholders: [{ name: placeholderName, fileUrl: matchedUrl }],
           });
         }
 
@@ -388,11 +278,13 @@ export function BulkCreator() {
           variants: variantsPayload,
         });
 
-        processedImages++;
-        setCreationProgress((processedImages / images.length) * 50); 
+        processedGroups++;
+        setCreationProgress((processedGroups / totalGroups) * 50); 
       }
 
-      // 3) CHIAMATA DIRETTA AL WORKER PER IL BULK CREATE (bypassa Supabase)
+      // -----------------------------------------------------------
+      // FASE 3: CHIAMATA BULK CREATE (Cloudflare Worker)
+      // -----------------------------------------------------------
       const createRes = await fetch("https://gelato-backend.andrea-bilotta00.workers.dev/gelato-bulk-create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -419,7 +311,7 @@ export function BulkCreator() {
       if (successCount > 0) {
         toast({
           title: "🎉 Products Created",
-          description: `Created ${successCount} products in your Gelato store. ${errorCount ? `${errorCount} failed.` : ""}`,
+          description: `Created ${successCount} grouped products in your Gelato store. ${errorCount ? `${errorCount} failed.` : ""}`,
         });
       } else {
         toast({
@@ -440,6 +332,11 @@ export function BulkCreator() {
     }
   };
 
+  const totalGroupsCalculated = Object.keys(images.reduce((acc: any, img) => {
+    acc[getCleanBaseTitle(img.name)] = true;
+    return acc;
+  }, {})).length;
+
   const completedSteps = [isConnected, images.length > 0, !!selectedProduct, createdProducts.length > 0].filter(Boolean).length;
   const successCount = createdProducts.filter((r: any) => r.status === "active").length;
   const hasSuccess = successCount > 0;
@@ -459,7 +356,6 @@ export function BulkCreator() {
         </CardContent>
       </Card>
 
-      {/* Step 1 */}
       <StepCard
         step={1}
         title="Connect Your Gelato Store"
@@ -472,11 +368,10 @@ export function BulkCreator() {
         )}
       </StepCard>
 
-      {/* Step 2 */}
       <StepCard
         step={2}
         title="Upload Your Design Files"
-        description="Select images and configure processing options"
+        description="Select images (3x4 and 5x7 formats will be automatically grouped)"
         isActive={currentStep === 2}
         isCompleted={images.length > 0}
       >
@@ -489,7 +384,6 @@ export function BulkCreator() {
         )}
       </StepCard>
 
-      {/* Step 3 */}
       <StepCard
         step={3}
         title="Choose Example Product"
@@ -502,7 +396,6 @@ export function BulkCreator() {
         )}
       </StepCard>
 
-      {/* Step 4 */}
       <StepCard
         step={4}
         title="Product Creation Rules"
@@ -518,13 +411,13 @@ export function BulkCreator() {
               <CardContent className="p-6 text-center space-y-4">
                 <div className="flex items-center justify-center space-x-2 mb-4">
                   <Package className="h-6 w-6 text-success" />
-                  <h3 className="text-lg font-semibold">Ready to Create Products</h3>
+                  <h3 className="text-lg font-semibold">Ready to Create Smart Products</h3>
                 </div>
 
                 <div className="grid grid-cols-3 gap-4 text-sm text-muted-foreground mb-6">
                   <div>
                     <div className="font-medium text-foreground">{images.length}</div>
-                    <div>Images Ready</div>
+                    <div>Files Uploaded</div>
                   </div>
                   <div>
                     <div className="font-medium text-foreground">{(template?.variants || []).length || 0}</div>
@@ -532,9 +425,9 @@ export function BulkCreator() {
                   </div>
                   <div>
                     <div className="font-medium text-foreground">
-                      {images.length * ((template?.variants || []).length || 0)}
+                      {totalGroupsCalculated}
                     </div>
-                    <div>Total Products</div>
+                    <div>Unique Products to Create</div>
                   </div>
                 </div>
 
@@ -542,7 +435,7 @@ export function BulkCreator() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Creating products...</span>
+                      <span>Processing raw files and creating products...</span>
                     </div>
                     <Progress value={creationProgress} />
                     <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% complete</p>
@@ -553,7 +446,7 @@ export function BulkCreator() {
                       <CheckCircle className="h-5 w-5" />
                       <span className="font-medium">Products Created Successfully!</span>
                     </div>
-                    <div className="text-sm text-muted-foreground">Created {successCount} products in your Gelato store</div>
+                    <div className="text-sm text-muted-foreground">Created {successCount} grouped products in your store</div>
                   </div>
                 ) : (
                   <Button
@@ -563,7 +456,7 @@ export function BulkCreator() {
                     className="bg-gradient-to-r from-success to-success/80 hover:opacity-90 text-white"
                   >
                     <Rocket className="h-4 w-4 mr-2" />
-                    Create {images.length} Products
+                    Create {totalGroupsCalculated} Grouped Products
                   </Button>
                 )}
               </CardContent>
