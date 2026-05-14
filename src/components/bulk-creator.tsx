@@ -89,47 +89,62 @@ function getVariantRatioTag(variantTitle: string): string {
 }
 
 // ==========================================
-// MOTORE DI UPLOAD MULTIPART (Bypassa limiti rete e crasch Cloudflare)
+// MOTORE DI UPLOAD MULTIPART (Bulletproof contro Timeout e CORS)
 // ==========================================
 async function uploadOriginalFile(file: File, exactFileName: string) {
   const BASE_URL = "https://gelato-backend.andrea-bilotta00.workers.dev";
-  const CHUNK_SIZE = 10 * 1024 * 1024; // Fette da 10MB per aggirare il blocco 413
+  const CHUNK_SIZE = 6 * 1024 * 1024; // 6MB Esatti (R2 Multipart richiede min 5MB a chunk, e salva dai Timeout 100s di CF)
   
   // 1. Inizializza
   const startRes = await fetch(`${BASE_URL}/upload-start?filename=${encodeURIComponent(exactFileName)}`, { method: "POST" });
-  if (!startRes.ok) throw new Error("Errore inizializzazione sul server");
+  if (!startRes.ok) {
+    const err = await startRes.text();
+    throw new Error(`Errore Server (Start): ${err}`);
+  }
+  
   const { uploadId, key } = await startRes.json();
+  
+  // FIX: Se l'uploadId ha caratteri speciali come "+" o "/", spacca la request se non lo codifichiamo!
+  const encodedUploadId = encodeURIComponent(uploadId);
+  const encodedKey = encodeURIComponent(key);
 
   const parts = [];
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-  // 2. Invia Fette
+  // 2. Invia Fette da 6MB
   for (let i = 0; i < totalChunks; i++) {
     const start = i * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, file.size);
-    // file.slice() legge solo quel frammento dal disco: Zero RAM sprecata!
     const chunk = file.slice(start, end);
     const partNumber = i + 1;
 
-    const partRes = await fetch(`${BASE_URL}/upload-part?uploadId=${uploadId}&key=${encodeURIComponent(key)}&partNumber=${partNumber}`, {
+    const partRes = await fetch(`${BASE_URL}/upload-part?uploadId=${encodedUploadId}&key=${encodedKey}&partNumber=${partNumber}`, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: chunk
     });
 
-    if (!partRes.ok) throw new Error(`Upload parte ${partNumber}/${totalChunks} fallito (Rete interrotta)`);
+    if (!partRes.ok) {
+      const err = await partRes.text();
+      throw new Error(`Upload parte ${partNumber}/${totalChunks} fallita. Server dice: ${err}`);
+    }
+    
     const partData = await partRes.json();
     parts.push(partData);
   }
 
   // 3. Completa e Incolla su R2
-  const completeRes = await fetch(`${BASE_URL}/upload-complete?uploadId=${uploadId}&key=${encodeURIComponent(key)}`, {
+  const completeRes = await fetch(`${BASE_URL}/upload-complete?uploadId=${encodedUploadId}&key=${encodedKey}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ parts })
   });
 
-  if (!completeRes.ok) throw new Error("Errore durante l'assemblaggio finale dell'immagine");
+  if (!completeRes.ok) {
+    const err = await completeRes.text();
+    throw new Error(`Errore assemblaggio (Complete): ${err}`);
+  }
+  
   const finalData = await completeRes.json();
   return finalData.url; 
 }
@@ -267,7 +282,7 @@ export function BulkCreator() {
            if (ratioTag === '3x4') exactFileName = `${baseTitle} (3x4).jpg`;
            if (ratioTag === '5x7') exactFileName = `${baseTitle} ISO (5x7).jpg`;
 
-           // Avvia l'Upload "A Fette" invulnerabile ai drop di connessione
+           // Motore a fette anti-timeout (6MB per evitare la ghigliottina CF a 100 secondi)
            const publicUrl = await uploadOriginalFile(imageObj.file, exactFileName);
            uploadedUrls[ratioTag] = publicUrl;
         }
@@ -309,7 +324,10 @@ export function BulkCreator() {
         })
       });
 
-      if (!createRes.ok) throw new Error("Errore durante la creazione dei prodotti in Gelato");
+      if (!createRes.ok) {
+        const errText = await createRes.text();
+        throw new Error(`Errore da Gelato Backend: ${errText}`);
+      }
       
       const data = await createRes.json();
       const results = data.results || [];
@@ -385,7 +403,7 @@ export function BulkCreator() {
       <StepCard
         step={2}
         title="Carica le Immagini Originali"
-        description="Nessuna compressione. Caricamento file giganteschi senza limiti via Chunking (pezzetti da 10MB)."
+        description="Nessuna compressione. Caricamento file giganteschi senza limiti via Chunking."
         isActive={currentStep === 2}
         isCompleted={images.length > 0}
       >
@@ -415,7 +433,7 @@ export function BulkCreator() {
       <StepCard
         step={4}
         title="Creazione Definitiva Prodotti"
-        description="Lancio del processo (Upload Multipart -> Generazione su Gelato)"
+        description="Lancio del processo (Upload Multipart 6MB -> Generazione su Gelato)"
         isActive={currentStep === 4}
         isCompleted={createdProducts.length > 0}
       >
@@ -451,7 +469,7 @@ export function BulkCreator() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-center space-x-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Caricamento a blocchi e Creazione in corso...</span>
+                      <span>Caricamento Chunk Protetti (6MB) e Creazione...</span>
                     </div>
                     <Progress value={creationProgress} />
                     <p className="text-sm text-muted-foreground">{Math.round(creationProgress)}% completato</p>
